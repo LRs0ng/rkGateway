@@ -480,7 +480,7 @@
 		ds18b20_pin: ds18b20_pin {
 			rockchip,pins =
 				/* data_pin */
-				<4 RK_PC6 RK_FUNC_GPIO &pcfg_pull_up_drv_level_1>,
+				<4 RK_PC6 RK_FUNC_GPIO &pcfg_pull_up_drv_level_1>;
 		};
 	};
 };
@@ -492,8 +492,14 @@
 };
 
 &imx415 {
-	pwdn-gpios = <&gpio3 RK_PA2 GPIO_ACTIVE_HIGH>;
+	status = "okay";
+	/* This BSP imx415 driver requests the power GPIO name, not pwdn. */
+	power-gpios = <&gpio3 RK_PA2 GPIO_ACTIVE_HIGH>;
 	reset-gpios = <&gpio2 RK_PA7 GPIO_ACTIVE_LOW>;
+	/* Connect the IMX415 rails instead of letting the driver use dummy regulators. */
+	dovdd-supply = <&cam_dovdd>;
+	avdd-supply = <&cam_avdd>;
+	dvdd-supply = <&cam_dvdd>;
 };
 
 &gc08a8 {

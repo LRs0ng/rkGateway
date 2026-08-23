@@ -124,3 +124,151 @@ build/tools/ds18b20_test
 - `OK`、`WARNING_OUT_OF_DS18B20_RANGE` 或 `INVALID_NON_FINITE` 状态。
 
 如果打开设备失败、驱动读取失败或返回长度不是 8 字节，工具会打印 `errno` 并返回非零退出码。
+
+## IMX415 摄像头抓拍工具与 miniGateway Push 插件
+
+本项目还包含一个不需要额外内核驱动的 V4L2 摄像头采集实现：
+
+- `plugins/camera/camera_capture.c/.h`：V4L2 单平面/多平面 MMAP 采集、格式转换公共实现；
+- `plugins/camera/camera.cpp/.hpp`：miniGateway `Push` 类型 camera source plugin；
+- `tools/camera_test.c`：开发板抓拍验证工具；
+- `configs/camera_periodic_linux.json`：周期采集示例；
+- `configs/camera_control_linux.json`：控制采集示例。
+
+IMX415 节点在 `temp/kernel-6.1/arch/arm64/boot/dts/rockchip/rk3568-lubancat-csi2-double.dtsi` 中默认是 `disabled`，本仓库的 `custom_dt.dts` 已通过：
+
+```dts
+&imx415 {
+    status = "okay";
+    ...
+};
+```
+
+启用它。该 DTS 使用 `imx415 -> csi2_dphy1 -> rkisp_vir0` 的链路。实际的 `/dev/videoX` 编号由开发板内核注册顺序决定，不能仅凭 DTS 固定假定。启动前建议在板上执行：
+
+```bash
+v4l2-ctl --list-devices
+v4l2-ctl -d /dev/videoX --list-formats-ext
+media-ctl -p
+```
+
+工具默认使用 `auto` 格式，按 MJPEG、NV12、YUYV、YUV420、RGB24 的顺序选择设备支持的格式。对于 RKISP 输出节点，NV12 或 YUYV 往往比 MJPEG 更常见；原始格式会被转换为无第三方依赖的 PPM (`P6`) 图片，MJPEG 帧则直接保存为 JPEG。工具支持 `V4L2_CAP_VIDEO_CAPTURE` 和 `V4L2_CAP_VIDEO_CAPTURE_MPLANE` 的 MMAP video capture 节点，并会根据设备能力自动选择单平面或多平面接口；不要直接选择只输出 RAW Bayer 的 CIF 节点作为 JPEG/PPM 图片源，应选择 ISP 输出节点。
+
+交叉编译后，工具位于 `build/tools/camera_test`。默认图片会保存到**可执行文件所在目录**：
+
+```bash
+# 默认抓拍一张，默认设备 /dev/video0，自动选择格式
+sudo ./camera_test
+
+# 指定 V4L2 节点和 ISP 输出格式
+sudo ./camera_test -d /dev/videoX -f nv12 -w 1920 -h 1080
+
+# 强制 MJPEG，成功时输出 JPEG
+sudo ./camera_test -d /dev/videoX -f mjpeg -o ./imx415.jpg
+
+# 连续抓拍；会生成 capture-0001.ppm、capture-0002.ppm ...
+sudo ./camera_test -d /dev/videoX -n 10 -i 1000
+```
+
+工具会先丢弃 `-u/--warmup` 指定数量的帧（默认 3 帧），以等待摄像头和 ISP 的初始状态稳定；单帧等待超时由 `-t/--timeout-ms` 控制。当前环境只进行了 AArch64 交叉编译和静态检查，没有访问真实摄像头。
+
+#### 调亮参数
+
+IMX415 没有通用的 `V4L2_CID_BRIGHTNESS` 传感器控件，画面偏暗时应优先调节曝光和模拟增益：
+
+```bash
+# 先查看板上的 sensor subdev 名称和控制范围
+for s in /dev/v4l-subdev*; do
+    echo "===== $s ====="
+    cat "/sys/class/video4linux/$(basename "$s")/name"
+done
+v4l2-ctl -d /dev/v4l-subdevX --list-ctrls
+
+# 使用自动查找 IMX415 subdev；适度增加模拟增益
+sudo ./camera_test -d /dev/video0 -f nv12 \
+    --control-device auto --analogue-gain 32
+
+# 同时增加曝光（单位是曝光行数，不是毫秒）
+sudo ./camera_test -d /dev/video0 -f nv12 \
+    --control-device auto --exposure 1000 --analogue-gain 32
+
+# 自动查找不到时，手工指定实际的 /dev/v4l-subdevX
+sudo ./camera_test -d /dev/video0 -f nv12 \
+    --control-device /dev/v4l-subdevX --exposure 1000 --analogue-gain 32
+```
+
+`analogue_gain` 的 IMX415 驱动范围通常为 `0..240`，`exposure` 的最大值会随当前分辨率、帧率和 VBLANK 动态变化，实际范围以 `v4l2-ctl --list-ctrls` 为准。`--brightness` 仍然保留为兼容 V4L2 输出节点的可选参数；如果节点不提供该控件，程序会报不支持，此时不代表摄像头故障。
+
+RKISP 的 AE/3A 运行时可能再次覆盖手动曝光和增益，因此这些参数是启动时的手动设置，不一定能锁定整段运行期间的亮度。若仍然偏暗，应检查镜头/补光、曝光上限、ISP IQ/AE 配置，或关闭自动曝光后再使用手动值。
+
+### camera Push plugin 配置
+
+插件库为 `build/miniGateway/libgateway_camera.so`，设备配置的点必须使用 `bytes` 或 `byte_array` 类型，例如：
+
+```json
+{
+  "id": "camera-1",
+  "driver": "camera",
+  "library": "./libgateway_camera.so",
+  "driver_config": {
+    "device": "/dev/videoX",
+    "width": 1920,
+    "height": 1080,
+    "pixfmt": "auto",
+    "mode": "periodic",
+    "interval_ms": 10000,
+    "warmup_frames": 3,
+    "capture_timeout_ms": 3000,
+    "control_command": "capture",
+    "control_device": "auto",
+    "exposure": 1000,
+    "analogue_gain": 32
+  },
+  "connection": {},
+  "points": [
+    {"name": "image", "type": "bytes", "unit": "", "address": {},
+     "scale": 1.0, "offset": 0.0}
+  ]
+}
+```
+
+`mode` 有两种值：
+
+- `periodic`：driver 启动后立即抓拍一帧，之后每隔 `interval_ms` 抓拍并通过 `SampleSink` 推送；
+- `control`：driver 启动并打开摄像头，但不主动抓拍；收到命令名为 `control_command`（默认 `capture`）的 `DeviceControlRequest` 后抓拍一次并推送一条 `RawBatch`。
+
+图片内容以 `gateway::ByteArray` 放在 point 的 `RawSample.value` 中，而不是仅传送文件路径。MJPEG 点中的字节是 JPEG 文件内容；NV12/YUYV/YUV420/RGB24 点中的字节是 PPM 文件内容。事件发布器需要支持 `ByteArray` 才能把图片转发到外部系统。
+
+processor plugin 发送拍照指令时使用 miniGateway 的处理上下文，例如：
+
+```cpp
+context.submit_control(gateway::DeviceControlRequest{
+    .request_id = "capture-001",
+    .device_id = "camera-1",
+    .command = "capture",
+    .arguments = {},
+    .deadline = gateway::ControlClock::now() +
+                std::chrono::seconds(5),
+});
+```
+
+`configs/camera_control_linux.json` 使用第三方自带的 `periodic_control` source 作为测试控制入口；实际部署时可以将它替换为自己的 processor 或外部控制 source。该示例每 10 秒向 `camera-1` 发送一次 `capture`，并非 camera plugin 自己的周期模式。
+
+选择摄像头配置构建时，例如：
+
+```bash
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DKERNEL_HEADERS="$PWD/temp/linux-headers-6.1.99-rk356x" \
+  -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+  -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+  -DGATEWAY_CONFIG="$PWD/configs/camera_periodic_linux.json"
+cmake --build build --parallel
+```
+
+构建后主要摄像头产物为：
+
+- `build/tools/camera_test`；
+- `build/miniGateway/libgateway_camera.so`；
+- `build/camera_periodic_config.json`；
+- `build/camera_control_config.json`。

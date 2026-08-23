@@ -1,0 +1,52 @@
+{
+  "runtime": {
+    "run_duration_ms": null,
+    "raw_queue_capacity": 8,
+    "control_queue_capacity": 8
+  },
+  "devices": [
+    {
+      "id": "camera-1",
+      "driver": "camera",
+      "library": "./libgateway_camera.so",
+      "driver_config": {
+        "device": "/dev/video0",
+        "width": 1920,
+        "height": 1080,
+        "pixfmt": "auto",
+        "mode": "control",
+        "warmup_frames": 3,
+        "capture_timeout_ms": 3000,
+        "control_command": "capture"
+      },
+      "connection": {},
+      "points": [
+        {
+          "name": "image",
+          "type": "bytes",
+          "unit": "",
+          "address": {},
+          "scale": 1.0,
+          "offset": 0.0
+        }
+      ]
+    }
+  ],
+  "groups": [],
+  "processors": [],
+  "event_publishers": [],
+  "device_control_sources": [
+    {
+      "id": "camera-test-control",
+      "type": "periodic_control",
+      "library": "./libgateway_periodic_control_source.so",
+      "config": {
+        "request_id_prefix": "camera-capture",
+        "device_ids": ["camera-1"],
+        "command": "capture",
+        "interval_ms": 10000,
+        "timeout_ms": 5000
+      }
+    }
+  ]
+}
