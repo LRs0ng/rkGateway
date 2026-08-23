@@ -1,0 +1,42 @@
+{
+  "runtime": {
+    "run_duration_ms": 10000,
+    "raw_queue_capacity": 32,
+    "control_queue_capacity": 32
+  },
+  "devices": [
+    {
+      "id": "ds18b20-1",
+      "driver": "ds18b20",
+      "library": "./libgateway_ds18b20.so",
+      "driver_config": {
+        "path": "/dev/ds18b20"
+      },
+      "connection": {},
+      "points": [
+        {
+          "name": "temperature",
+          "type": "double",
+          "unit": "C",
+          "address": {},
+          "scale": 1.0,
+          "offset": 0.0,
+          "minimum": -55.0,
+          "maximum": 125.0
+        }
+      ]
+    }
+  ],
+  "groups": [
+    {
+      "id": "ds18b20-temperature",
+      "device_id": "ds18b20-1",
+      "interval_ms": 1000,
+      "timeout_ms": 1000,
+      "points": ["temperature"]
+    }
+  ],
+  "processors": [],
+  "event_publishers": [],
+  "device_control_sources": []
+}

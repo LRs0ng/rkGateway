@@ -1,0 +1,10 @@
+temp/
+build/
+# Kbuild external-module intermediates
+drivers/ds18b20/.*
+drivers/ds18b20/*.o
+drivers/ds18b20/*.ko
+drivers/ds18b20/*.mod
+drivers/ds18b20/*.mod.c
+drivers/ds18b20/Module.symvers
+drivers/ds18b20/modules.order
