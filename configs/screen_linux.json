@@ -1,0 +1,67 @@
+{
+  "runtime": {
+    "run_duration_ms": null,
+    "raw_queue_capacity": 32,
+    "control_queue_capacity": 32
+  },
+  "devices": [
+    {
+      "id": "camera-1",
+      "driver": "camera",
+      "library": "./libgateway_camera.so",
+      "driver_config": {
+        "device": "/dev/video0",
+        "width": 1920,
+        "height": 1080,
+        "pixfmt": "auto",
+        "mode": "periodic",
+        "interval_ms": 10000,
+        "warmup_frames": 3,
+        "capture_timeout_ms": 3000
+      },
+      "connection": {},
+      "points": [
+        {
+          "name": "image",
+          "type": "bytes",
+          "unit": "",
+          "address": {},
+          "scale": 1.0,
+          "offset": 0.0
+        }
+      ]
+    }
+  ],
+  "groups": [],
+  "processors": [],
+  "event_publishers": [
+    {
+      "id": "screen",
+      "type": "screen",
+      "library": "./libgateway_screen.so",
+      "enabled": true,
+      "config": {
+        "device": "/dev/fb0",
+        "panel_controller": "hx8399-c",
+        "touch_controller": "gt911",
+        "pixel_format": "rgb888",
+        "expected_width": 1080,
+        "expected_height": 1920,
+        "image_point": "image",
+        "image_format": "auto",
+        "image_width": 1920,
+        "image_height": 1080,
+        "fit_image": true,
+        "numeric_scale": 1,
+        "numeric_x": 0,
+        "numeric_y": 0,
+        "numeric_foreground": "0xffffff",
+        "numeric_background": "0x000000",
+        "clear_before_numeric": true,
+        "output_mode": "landscape",
+        "rotation_degrees": 90
+      }
+    }
+  ],
+  "device_control_sources": []
+}

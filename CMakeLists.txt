@@ -38,6 +38,10 @@ configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/configs/camera_control_linux.json"
     "${CMAKE_CURRENT_BINARY_DIR}/camera_control_config.json"
     COPYONLY)
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/configs/screen_linux.json"
+    "${CMAKE_CURRENT_BINARY_DIR}/screen_config.json"
+    COPYONLY)
 
 # miniGateway remains a third-party subproject. Its own targets are emitted
 # into build/miniGateway; the DS18B20 plugin below is emitted beside the
@@ -71,6 +75,31 @@ set_target_properties(gateway_camera PROPERTIES
 target_compile_options(gateway_camera PRIVATE
     -Wall -Wextra -Wpedantic -Wconversion)
 
+add_library(screen_fb_support STATIC
+    plugins/screen/screen_fb.c)
+target_include_directories(screen_fb_support PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/plugins/screen")
+target_compile_options(screen_fb_support PRIVATE
+    -Wall -Wextra -Wpedantic -Wconversion)
+
+add_library(gateway_screen SHARED
+    plugins/screen/screen.cpp)
+target_include_directories(gateway_screen PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/plugins/screen"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniGateway/include")
+target_link_libraries(gateway_screen
+    PUBLIC gateway_core
+    PRIVATE screen_fb_support nlohmann_json::nlohmann_json)
+set_target_properties(gateway_screen PROPERTIES
+    OUTPUT_NAME "gateway_screen"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/miniGateway"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/miniGateway"
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/miniGateway"
+    BUILD_RPATH_USE_ORIGIN ON
+    INSTALL_RPATH "$ORIGIN")
+target_compile_options(gateway_screen PRIVATE
+    -Wall -Wextra -Wpedantic -Wconversion)
+
 add_library(gateway_ds18b20 SHARED
     plugins/ds18b20/ds18b20.cpp)
 target_include_directories(gateway_ds18b20 PRIVATE
@@ -89,7 +118,7 @@ set_target_properties(gateway_ds18b20 PROPERTIES
 target_compile_options(gateway_ds18b20 PRIVATE
     -Wall -Wextra -Wpedantic -Wconversion)
 
-add_dependencies(miniGateway gateway_ds18b20 gateway_camera)
+add_dependencies(miniGateway gateway_ds18b20 gateway_camera gateway_screen)
 
 set(KERNEL_MODULE_BUILD_DIR
     "${CMAKE_CURRENT_BINARY_DIR}/kernel/ds18b20")
@@ -130,6 +159,16 @@ set_target_properties(camera_test PROPERTIES
 target_compile_options(camera_test PRIVATE
     -Wall -Wextra -Wpedantic -Wconversion)
 
+add_executable(screen_test
+    tools/screen_test.c)
+target_include_directories(screen_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/plugins/screen")
+target_link_libraries(screen_test PRIVATE screen_fb_support)
+set_target_properties(screen_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tools")
+target_compile_options(screen_test PRIVATE
+    -Wall -Wextra -Wpedantic -Wconversion)
+
 add_executable(ds18b20_test
     tools/ds18b20_test.c)
 set_target_properties(ds18b20_test PROPERTIES
@@ -139,4 +178,4 @@ target_compile_options(ds18b20_test PRIVATE
 
 add_custom_target(ds18b20_artifacts ALL
     DEPENDS ds18b20_kernel_module gateway_ds18b20 gateway_camera
-            miniGateway ds18b20_test camera_test)
+            miniGateway ds18b20_test camera_test screen_test gateway_screen)

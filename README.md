@@ -272,3 +272,104 @@ cmake --build build --parallel
 - `build/miniGateway/libgateway_camera.so`；
 - `build/camera_periodic_config.json`；
 - `build/camera_control_config.json`。
+
+## HX8399-C / RGB888 屏幕显示工具与 miniGateway Event Publisher
+
+屏幕部分已按目标面板更新为 **1080×1920（竖屏）、HX8399-C、RGB888、GT911**：
+
+- `plugins/screen/screen_fb.h/.c`：用户态 framebuffer 操作、P6 PPM/RGB888/RGB565 显示和 5×7 数字绘制；
+- `plugins/screen/screen.hpp/.cpp`：miniGateway `IEventPublisher` 屏幕插件；
+- `tools/screen_test.c`：开发板上的图片显示测试工具；
+- `configs/screen_linux.json`：1920×1080 摄像头图片发送到 1080×1920 屏幕的示例配置。
+
+### 硬件前提与边界
+
+本实现仍然使用内核已经创建好的 framebuffer（默认 `/dev/fb0`），不会在用户态模拟 MIPI DSI 时序，也不会替代 HX8399-C 的 panel 驱动、初始化序列、供电、复位和背光控制。HX8399-C 通常通过 MIPI DSI 连接；必须先由内核 DTS 和 DRM panel/DSI 驱动正确初始化面板，用户态程序才能显示图像。
+
+插件启动时会检查 framebuffer 是否为 **1080×1920**，并检查红、绿、蓝通道是否均为 8 bit（RGB888 通道布局）。如果 framebuffer 仍然是其他分辨率或 RGB565 配置，插件会拒绝启动；测试工具会打印警告，便于定位内核/DTS 配置问题。
+
+GT911 是 I2C 触摸控制器，触摸事件不属于该屏幕 Event Publisher 的显示路径。内核需要在实际使用的 I2C 总线上启用 `goodix,gt911` 节点，并正确配置 `interrupts`、`reset-gpios`、坐标范围和旋转方向；屏幕插件不会读取或处理 `/dev/input/event*`。
+
+当前 `custom_dt.dts` 实际启用了 `route_dsi0`、`video_phy0` 和 `dsi0`，面板节点使用 `simple-panel-dsi`，配置为 4-lane、RGB888，原生时序为 1080×1920，并包含 HX8399-C 初始化/退出序列；GT911 节点位于 I2C1（地址 0x5d）。`rk3566-lubancat-1io-dsi0/1.dtsi` 中的模板节点仍是 disabled 示例，但会被顶层 `custom_dt.dts` 的设置覆盖。用户态代码仍不替代内核的 DRM、DSI、面板初始化、供电、复位和背光驱动；只有内核成功创建匹配的 `/dev/fb0` 后才能显示。
+
+### 测试工具
+
+将 `build/tools/screen_test` 拷贝到开发板，在有 framebuffer 权限的情况下执行：
+
+```bash
+# 竖屏：输入 1080x1920，直接显示
+sudo ./screen_test -d /dev/fb0 -i image.rgb888 \
+    -f rgb888 -w 1080 -h 1920 --mode portrait
+
+# 横屏逻辑模式：输入 1920x1080，顺时针旋转 90 度写入物理 1080x1920 framebuffer
+sudo ./screen_test -d /dev/fb0 -i image.rgb888 \
+    -f rgb888 -w 1920 -h 1080 --mode landscape --rotation 90
+
+# 显示 P6 PPM 图片；工具会从 PPM 头部读取尺寸
+sudo ./screen_test -d /dev/fb0 -i capture.ppm -f auto \
+    --mode landscape --rotation 90
+
+# 横屏显示并在逻辑左上角叠加数字
+sudo ./screen_test -d /dev/fb0 -i image.rgb888 \
+    -f rgb888 -w 1920 -h 1080 --mode landscape --rotation 90 \
+    --number 26.25
+
+# 清屏
+sudo ./screen_test -d /dev/fb0 --clear
+```
+
+`rgb888`/`rgb24` 输入为连续的 `RGBRGB...` 字节；`rgb565` 仍作为兼容格式保留。framebuffer 的物理尺寸始终是 **1080×1920**，而 `--mode landscape` 会建立 **1920×1080** 的逻辑画布并默认使用顺时针 `90` 度旋转；`--rotation 270` 可改为逆时针 90 度，另外支持 `0` 和 `180`。工具会根据旋转方向自动选择 raw 输入默认尺寸：竖屏为 1080×1920，横屏为 1920×1080；显式 `-w/-h` 会覆盖默认值。工具启动时会输出物理 framebuffer 实际分辨率、逻辑尺寸、旋转角度、bpp 以及是否检测到 RGB888 通道布局。
+
+### Event Publisher 配置
+
+`configs/screen_linux.json` 将 camera push source 的 `image` 点连接到屏幕 publisher，并声明目标屏幕参数：
+
+```json
+{
+  "id": "screen",
+  "type": "screen",
+  "library": "./libgateway_screen.so",
+  "enabled": true,
+  "config": {
+    "device": "/dev/fb0",
+    "panel_controller": "hx8399-c",
+    "touch_controller": "gt911",
+    "pixel_format": "rgb888",
+    "expected_width": 1080,
+    "expected_height": 1920,
+    "output_mode": "landscape",
+    "rotation_degrees": 90,
+    "image_point": "image",
+    "image_format": "auto",
+    "image_width": 1920,
+    "image_height": 1080,
+    "fit_image": true,
+    "numeric_scale": 1,
+    "numeric_x": 0,
+    "numeric_y": 0,
+    "numeric_foreground": "0xffffff",
+    "numeric_background": "0x000000",
+    "clear_before_numeric": true
+  }
+}
+```
+
+注意：配置中的 `image_width`/`image_height` 描述输入原始图像；当前 camera plugin 输出 1920×1080，屏幕 framebuffer 则按 DTS 为 1080×1920。`output_mode` 只描述用户态逻辑画布，`expected_width`/`expected_height` 仍必须填写物理 framebuffer 的 1080×1920；`rotation_degrees: 90` 表示把逻辑 1920×1080 图像顺时针旋转后写入物理屏幕。若画面方向相反，将其改为 `270`。
+
+插件行为：
+
+1. Event 中找到配置的 `image_point`（默认 `image`）且质量为 `Good` 时显示图像；
+2. P6 PPM 会自动解析为 RGB888；原始图像可显式使用 `rgb888`/`rgb24` 或兼容的 `rgb565`；
+3. 若没有同名点，会尝试显示 Event 中的第一个二进制点；
+4. Event 中的整数、double 和布尔数值点会以小号 5×7 字体逐行绘制在左上角；
+5. `output_mode` 支持 `portrait`/`landscape`；未显式设置 `rotation_degrees` 时，两个模式分别默认使用 0/90 度；显式角度支持 0、90、180、270；
+6. 图像缩放先在逻辑画布中完成，再按旋转角度写入物理 framebuffer，数字叠加也使用同一旋转坐标系；
+7. `expected_width`、`expected_height` 和 `pixel_format` 用于启动时校验目标 framebuffer，面板控制器和触摸控制器字段用于配置标识，不会代替内核驱动。
+
+构建完成后，文件位于：
+
+- `build/miniGateway/libgateway_screen.so`；
+- `build/tools/screen_test`；
+- `build/screen_config.json`。
+
+本地构建只进行 AArch64 交叉编译和静态检查，不加载驱动、不访问 GPIO/LCD，也不在本机运行 AArch64 程序。
