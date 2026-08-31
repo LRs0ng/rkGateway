@@ -39,6 +39,7 @@ private:
     uint32_t numeric_foreground_{0xffffffU};
     uint32_t numeric_background_{0x000000U};
     bool clear_before_numeric_{true};
+    bool wait_for_vsync_{true};
 
     screen_fb_t* screen_{nullptr};
     std::mutex mutex_;

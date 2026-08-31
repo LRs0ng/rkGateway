@@ -58,6 +58,7 @@
         "numeric_foreground": "0xffffff",
         "numeric_background": "0x000000",
         "clear_before_numeric": true,
+        "wait_for_vsync": true,
         "output_mode": "landscape",
         "rotation_degrees": 90
       }

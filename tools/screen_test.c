@@ -26,6 +26,7 @@ static void usage(const char *program)
             "      --no-fit             不保持比例，直接缩放到逻辑画布\n"
             "      --number VALUE       在左上角显示一个数字\n"
             "      --clear              只清屏，不显示图片\n"
+            "      --no-vsync           提交帧前不等待垂直同步\n"
             "      --help               显示帮助\n",
             program);
 }
@@ -133,6 +134,7 @@ int main(int argc, char **argv)
     int fit = 1;
     int clear_only = 0;
     int have_number = 0;
+    int wait_for_vsync = 1;
     double number = 0.0;
     unsigned char *image = NULL;
     size_t image_size = 0U;
@@ -150,6 +152,7 @@ int main(int argc, char **argv)
         {"no-fit", no_argument, NULL, 2},
         {"number", required_argument, NULL, 3},
         {"clear", no_argument, NULL, 4},
+        {"no-vsync", no_argument, NULL, 5},
         {"help", no_argument, NULL, 1},
         {NULL, 0, NULL, 0}
     };
@@ -216,6 +219,9 @@ int main(int argc, char **argv)
         case 4:
             clear_only = 1;
             break;
+        case 5:
+            wait_for_vsync = 0;
+            break;
         default:
             usage(argv[0]);
             goto cleanup;
@@ -261,6 +267,8 @@ int main(int argc, char **argv)
     if (!screen_fb_is_rgb888(screen)) {
         fprintf(stderr, "警告: framebuffer 不是 RGB888 通道布局，目标屏幕应为 RGB888\n");
     }
+    screen_fb_set_deferred_present(screen, 1);
+    screen_fb_set_wait_for_vsync(screen, wait_for_vsync);
     fprintf(stdout, "mode=%s rotation=%u logical_size=%ux%u input_size=%ux%u\n",
             mode, rotation,
             (rotation == 90U || rotation == 270U) ? screen_fb_height(screen)
@@ -294,6 +302,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "显示数字失败: %s\n", strerror(errno));
         goto cleanup;
     }
+    if (screen_fb_flush(screen) < 0) {
+        fprintf(stderr, "提交完整帧失败: %s\n", strerror(errno));
+        goto cleanup;
+    }
+    fprintf(stdout, "buffering=shadow-copy vsync=%s\n",
+            wait_for_vsync ? "on" : "off");
     exit_code = EXIT_SUCCESS;
 
 cleanup:

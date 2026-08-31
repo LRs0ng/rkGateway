@@ -21,6 +21,19 @@ unsigned int screen_fb_bpp(const screen_fb_t *screen);
 /* True when the framebuffer exposes 8-bit red, green and blue channels. */
 int screen_fb_is_rgb888(const screen_fb_t *screen);
 
+/*
+ * Drawing is performed in a userspace shadow framebuffer.  A flush copies the
+ * completed frame to the scanout framebuffer in one short operation, avoiding
+ * the visible top-to-bottom update caused by drawing directly into /dev/fb0.
+ *
+ * Deferred mode lets callers compose an image and overlays, then expose them
+ * together with one screen_fb_flush().  Immediate mode remains the default for
+ * compatibility with simple callers.
+ */
+void screen_fb_set_deferred_present(screen_fb_t *screen, int deferred);
+void screen_fb_set_wait_for_vsync(screen_fb_t *screen, int wait_for_vsync);
+int screen_fb_flush(screen_fb_t *screen);
+
 int screen_fb_clear(screen_fb_t *screen, uint32_t rgb888);
 
 /*

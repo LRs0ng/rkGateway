@@ -316,9 +316,15 @@ sudo ./screen_test -d /dev/fb0 -i image.rgb888 \
 
 # 清屏
 sudo ./screen_test -d /dev/fb0 --clear
+
+# 若需比较垂直同步效果，可临时禁用 VSync（通常不建议）
+sudo ./screen_test -d /dev/fb0 -i capture.ppm -f auto \
+    --mode landscape --rotation 90 --no-vsync
 ```
 
 `rgb888`/`rgb24` 输入为连续的 `RGBRGB...` 字节；`rgb565` 仍作为兼容格式保留。framebuffer 的物理尺寸始终是 **1080×1920**，而 `--mode landscape` 会建立 **1920×1080** 的逻辑画布并默认使用顺时针 `90` 度旋转；`--rotation 270` 可改为逆时针 90 度，另外支持 `0` 和 `180`。工具会根据旋转方向自动选择 raw 输入默认尺寸：竖屏为 1080×1920，横屏为 1920×1080；显式 `-w/-h` 会覆盖默认值。工具启动时会输出物理 framebuffer 实际分辨率、逻辑尺寸、旋转角度、bpp 以及是否检测到 RGB888 通道布局。
+
+屏幕库不会再逐像素修改正在扫描输出的 `/dev/fb0`。图像缩放、旋转和数字叠加先在用户空间 shadow framebuffer 中完成，随后等待一次 VSync，并用一次整帧内存复制提交到 scanout framebuffer。这样耗时的像素转换过程发生在不可见缓冲区中，Event 内的图片和数字也只提交一次，可显著减少肉眼可见的从上到下扫描更新。该方式是 fbdev 上的软件双缓冲；若仍要求严格无撕裂和高帧率视频播放，需要进一步改用 DRM/KMS 双 dumb buffer 与 page flip。
 
 ### Event Publisher 配置
 
@@ -349,7 +355,8 @@ sudo ./screen_test -d /dev/fb0 --clear
     "numeric_y": 0,
     "numeric_foreground": "0xffffff",
     "numeric_background": "0x000000",
-    "clear_before_numeric": true
+    "clear_before_numeric": true,
+    "wait_for_vsync": true
   }
 }
 ```
@@ -365,6 +372,7 @@ sudo ./screen_test -d /dev/fb0 --clear
 5. `output_mode` 支持 `portrait`/`landscape`；未显式设置 `rotation_degrees` 时，两个模式分别默认使用 0/90 度；显式角度支持 0、90、180、270；
 6. 图像缩放先在逻辑画布中完成，再按旋转角度写入物理 framebuffer，数字叠加也使用同一旋转坐标系；
 7. `expected_width`、`expected_height` 和 `pixel_format` 用于启动时校验目标 framebuffer，面板控制器和触摸控制器字段用于配置标识，不会代替内核驱动。
+8. `wait_for_vsync` 默认为 `true`，完整帧提交前通过 `FBIO_WAITFORVSYNC` 等待垂直同步；若目标 fbdev 不支持该 ioctl，库会自动退化为立即整帧复制。
 
 构建完成后，文件位于：
 

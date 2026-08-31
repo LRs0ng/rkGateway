@@ -18,8 +18,15 @@ struct screen_fb {
     int fd;
     uint8_t *memory;
     size_t memory_size;
+    uint8_t *shadow;
+    size_t shadow_size;
+    size_t visible_row_size;
     struct fb_fix_screeninfo fix;
     struct fb_var_screeninfo var;
+    int deferred_present;
+    int wait_for_vsync;
+    int vsync_supported;
+    int dirty;
 };
 
 static int set_errno_value(int value)
@@ -67,11 +74,10 @@ static int put_pixel(screen_fb_t *screen, int x, int y, uint32_t rgb888)
     if (bytes_per_pixel == 0U || bytes_per_pixel > 4U) {
         return set_errno_value(ENOTSUP);
     }
-    pixel = screen->memory + (size_t)(y + (int)screen->var.yoffset) *
-            screen->fix.line_length +
-            (size_t)(x + (int)screen->var.xoffset) * bytes_per_pixel;
-    if ((size_t)(pixel - screen->memory) + bytes_per_pixel >
-        screen->memory_size) {
+    pixel = screen->shadow + (size_t)y * screen->fix.line_length +
+            (size_t)x * bytes_per_pixel;
+    if ((size_t)(pixel - screen->shadow) + bytes_per_pixel >
+        screen->shadow_size) {
         return set_errno_value(EIO);
     }
     if (bytes_per_pixel == 2U) {
@@ -86,7 +92,13 @@ static int put_pixel(screen_fb_t *screen, int x, int y, uint32_t rgb888)
     } else {
         pixel[0] = (uint8_t)packed;
     }
+    screen->dirty = 1;
     return 0;
+}
+
+static int flush_if_immediate(screen_fb_t *screen)
+{
+    return screen->deferred_present ? 0 : screen_fb_flush(screen);
 }
 
 static int fill_rect(screen_fb_t *screen, int x, int y, unsigned int width,
@@ -298,6 +310,9 @@ static int parse_ppm(const uint8_t *data, size_t size, const uint8_t **pixels,
 screen_fb_t *screen_fb_open(const char *device)
 {
     screen_fb_t *screen;
+    unsigned int bytes_per_pixel;
+    size_t mapped_offset;
+    unsigned int row;
     if (device == NULL || device[0] == '\0') {
         errno = EINVAL;
         return NULL;
@@ -337,6 +352,38 @@ screen_fb_t *screen_fb_open(const char *device)
         errno = ENOTSUP;
         return NULL;
     }
+    bytes_per_pixel = (screen->var.bits_per_pixel + 7U) / 8U;
+    if ((size_t)screen->var.xres > SIZE_MAX / bytes_per_pixel ||
+        (size_t)screen->fix.line_length > SIZE_MAX / screen->var.yres) {
+        screen_fb_close(screen);
+        errno = EOVERFLOW;
+        return NULL;
+    }
+    screen->visible_row_size = (size_t)screen->var.xres * bytes_per_pixel;
+    screen->shadow_size = (size_t)screen->fix.line_length * screen->var.yres;
+    mapped_offset = (size_t)screen->var.yoffset * screen->fix.line_length +
+                    (size_t)screen->var.xoffset * bytes_per_pixel;
+    if (screen->visible_row_size > screen->fix.line_length ||
+        mapped_offset > screen->memory_size ||
+        screen->shadow_size > screen->memory_size - mapped_offset) {
+        screen_fb_close(screen);
+        errno = EIO;
+        return NULL;
+    }
+    screen->shadow = malloc(screen->shadow_size);
+    if (screen->shadow == NULL) {
+        screen_fb_close(screen);
+        return NULL;
+    }
+    memset(screen->shadow, 0, screen->shadow_size);
+    for (row = 0U; row < screen->var.yres; ++row) {
+        memcpy(screen->shadow + (size_t)row * screen->fix.line_length,
+               screen->memory + mapped_offset +
+                   (size_t)row * screen->fix.line_length,
+               screen->visible_row_size);
+    }
+    screen->wait_for_vsync = 1;
+    screen->vsync_supported = -1;
     return screen;
 }
 
@@ -348,6 +395,7 @@ void screen_fb_close(screen_fb_t *screen)
     if (screen->memory != NULL && screen->memory != MAP_FAILED) {
         (void)munmap(screen->memory, screen->memory_size);
     }
+    free(screen->shadow);
     if (screen->fd >= 0) {
         (void)close(screen->fd);
     }
@@ -379,13 +427,73 @@ int screen_fb_is_rgb888(const screen_fb_t *screen)
            screen->var.blue.length == 8U;
 }
 
+void screen_fb_set_deferred_present(screen_fb_t *screen, int deferred)
+{
+    if (screen != NULL) {
+        screen->deferred_present = deferred != 0;
+    }
+}
+
+void screen_fb_set_wait_for_vsync(screen_fb_t *screen, int wait_for_vsync)
+{
+    if (screen != NULL) {
+        screen->wait_for_vsync = wait_for_vsync != 0;
+    }
+}
+
+int screen_fb_flush(screen_fb_t *screen)
+{
+    unsigned int row;
+    unsigned int bytes_per_pixel;
+    size_t mapped_offset;
+
+    if (screen == NULL || screen->shadow == NULL) {
+        return set_errno_value(EINVAL);
+    }
+    if (!screen->dirty) {
+        return 0;
+    }
+    if (screen->wait_for_vsync && screen->vsync_supported != 0) {
+        __u32 crtc = 0U;
+        if (ioctl(screen->fd, FBIO_WAITFORVSYNC, &crtc) == 0) {
+            screen->vsync_supported = 1;
+        } else if (errno == ENOTTY || errno == EINVAL || errno == ENOSYS ||
+                   errno == ENOTSUP) {
+            screen->vsync_supported = 0;
+        } else {
+            return -1;
+        }
+    }
+
+    bytes_per_pixel = (screen->var.bits_per_pixel + 7U) / 8U;
+    mapped_offset = (size_t)screen->var.yoffset * screen->fix.line_length +
+                    (size_t)screen->var.xoffset * bytes_per_pixel;
+    if (screen->var.xoffset == 0U &&
+        screen->visible_row_size == screen->fix.line_length) {
+        memcpy(screen->memory + mapped_offset, screen->shadow,
+               screen->shadow_size);
+    } else {
+        for (row = 0U; row < screen->var.yres; ++row) {
+            memcpy(screen->memory + mapped_offset +
+                       (size_t)row * screen->fix.line_length,
+                   screen->shadow + (size_t)row * screen->fix.line_length,
+                   screen->visible_row_size);
+        }
+    }
+    screen->dirty = 0;
+    return 0;
+}
+
 int screen_fb_clear(screen_fb_t *screen, uint32_t rgb888)
 {
     if (screen == NULL) {
         return set_errno_value(EINVAL);
     }
-    return fill_rect(screen, 0, 0, screen->var.xres, screen->var.yres,
-                     rgb888 & UINT32_C(0xffffff));
+    if (fill_rect(screen, 0, 0, screen->var.xres, screen->var.yres,
+                  rgb888 & UINT32_C(0xffffff)) < 0) {
+        return -1;
+    }
+    return flush_if_immediate(screen);
 }
 
 static const uint8_t *raw_rgb24_pixel(const uint8_t *pixels, unsigned int width,
@@ -518,7 +626,7 @@ int screen_fb_present_rotated(screen_fb_t *screen, const uint8_t *data, size_t s
             }
         }
     }
-    return 0;
+    return flush_if_immediate(screen);
 }
 
 int screen_fb_present(screen_fb_t *screen, const uint8_t *data, size_t size,
@@ -613,7 +721,7 @@ int screen_fb_draw_number_rotated(screen_fb_t *screen, double value, int x, int 
             }
         }
     }
-    return 0;
+    return flush_if_immediate(screen);
 }
 
 int screen_fb_draw_number(screen_fb_t *screen, double value, int x, int y,

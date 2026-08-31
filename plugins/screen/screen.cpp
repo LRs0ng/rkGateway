@@ -185,6 +185,7 @@ ScreenEventPublisher::ScreenEventPublisher(std::string settings_json)
     numeric_foreground_ = optional_color(settings, "numeric_foreground", 0xffffffU);
     numeric_background_ = optional_color(settings, "numeric_background", 0x000000U);
     clear_before_numeric_ = optional_bool(settings, "clear_before_numeric", true);
+    wait_for_vsync_ = optional_bool(settings, "wait_for_vsync", true);
 }
 
 ScreenEventPublisher::~ScreenEventPublisher()
@@ -243,12 +244,21 @@ void ScreenEventPublisher::start()
         throw std::invalid_argument(
             "framebuffer is not RGB888 (red/green/blue channels must be 8-bit)");
     }
+    screen_fb_set_deferred_present(screen_, 1);
+    screen_fb_set_wait_for_vsync(screen_, wait_for_vsync_ ? 1 : 0);
     if (screen_fb_clear(screen_, 0x000000U) < 0) {
         const int saved = errno;
         screen_fb_close(screen_);
         screen_ = nullptr;
         throw std::system_error(saved, std::generic_category(),
                                 "clear framebuffer " + device_);
+    }
+    if (screen_fb_flush(screen_) < 0) {
+        const int saved = errno;
+        screen_fb_close(screen_);
+        screen_ = nullptr;
+        throw std::system_error(saved, std::generic_category(),
+                                "present framebuffer " + device_);
     }
     started_ = true;
     std::cerr << "screen publisher: device=" << device_
@@ -262,6 +272,8 @@ void ScreenEventPublisher::start()
               << "x"
               << ((rotation_degrees_ == 90U || rotation_degrees_ == 270U)
                       ? screen_fb_width(screen_) : screen_fb_height(screen_))
+              << " buffering=shadow-copy"
+              << " vsync=" << (wait_for_vsync_ ? "on" : "off")
               << "\n";
 }
 
@@ -318,6 +330,11 @@ EventPublishResult ScreenEventPublisher::publish(const Event& event)
     }
     if (!displayed_image && !drew_number) {
         return EventPublishResult::Accepted;
+    }
+    if (screen_fb_flush(screen_) < 0) {
+        std::cerr << "screen publisher: present composed frame failed: "
+                  << std::strerror(errno) << "\n";
+        return EventPublishResult::Rejected;
     }
     return EventPublishResult::Accepted;
 }
