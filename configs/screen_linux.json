@@ -17,7 +17,10 @@
         "mode": "periodic",
         "interval_ms": 10000,
         "warmup_frames": 3,
-        "capture_timeout_ms": 3000
+        "capture_timeout_ms": 3000,
+        "snapshot_policy": "latest",
+        "snapshot_wait_ms": 1000,
+        "max_frame_age_ms": 500
       },
       "connection": {},
       "points": [

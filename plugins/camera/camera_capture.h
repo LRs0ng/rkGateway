@@ -37,6 +37,7 @@ typedef struct camera_control_settings {
 typedef struct camera_capture {
     int fd;
     int control_fd;
+    int cancel_fd;
     unsigned int width;
     unsigned int height;
     unsigned int bytesperline;
@@ -55,6 +56,7 @@ typedef struct camera_capture {
 typedef struct camera_frame {
     uint8_t *data;
     size_t size;
+    size_t capacity;
     unsigned int width;
     unsigned int height;
     unsigned int bytesperline;
@@ -80,12 +82,21 @@ int camera_capture_init(
     const camera_control_settings_t *controls);
 
 int camera_capture_read(camera_capture_t *capture, camera_frame_t *frame);
+/* frame must be zero-initialized or previously returned by this function. */
+int camera_capture_read_reuse(camera_capture_t *capture, camera_frame_t *frame);
+/* Wake a thread blocked in camera_capture_read[_reuse](). */
+void camera_capture_cancel(camera_capture_t *capture);
 void camera_frame_release(camera_frame_t *frame);
 void camera_capture_close(camera_capture_t *capture);
 
-/* Return a malloc'ed image. MJPEG is copied unchanged; raw formats become PPM. */
-int camera_frame_to_image(const camera_frame_t *frame, uint8_t **data, size_t *size,
-                         uint32_t *image_format);
+/* Required output capacity. MJPEG stays unchanged; raw formats become PPM. */
+int camera_frame_image_capacity(const camera_frame_t *frame, size_t *capacity);
+int camera_frame_to_image_buffer(const camera_frame_t *frame, uint8_t *data,
+                                 size_t capacity, size_t *size,
+                                 uint32_t *image_format);
+/* Compatibility allocator used by camera_test and external callers. */
+int camera_frame_to_image(const camera_frame_t *frame, uint8_t **data,
+                          size_t *size, uint32_t *image_format);
 
 #ifdef __cplusplus
 }

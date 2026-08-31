@@ -128,6 +128,18 @@ CameraDriver::Mode parse_mode(const plugin_json::Json& settings) {
     plugin_json::fail(kPluginName, "mode", "must be periodic or control");
 }
 
+CameraDriver::SnapshotPolicy parse_snapshot_policy(
+    const plugin_json::Json& settings) {
+    const auto policy = optional_string(settings, "snapshot_policy", "latest");
+    if (policy == "latest") {
+        return CameraDriver::SnapshotPolicy::Latest;
+    }
+    if (policy == "next") {
+        return CameraDriver::SnapshotPolicy::Next;
+    }
+    plugin_json::fail(kPluginName, "snapshot_policy", "must be latest or next");
+}
+
 camera_pixel_format_t parse_pixel_format(const plugin_json::Json& settings) {
     const auto value = optional_string(settings, "pixfmt", "auto");
     camera_pixel_format_t format = CAMERA_PIXFMT_AUTO;
@@ -166,6 +178,11 @@ std::unique_ptr<CameraDriver> make_camera(std::string_view settings_json) {
         std::chrono::milliseconds{interval_ms},
         optional_unsigned(settings, "warmup_frames", 3U),
         timeout_ms,
+        parse_snapshot_policy(settings),
+        std::chrono::milliseconds{optional_unsigned(
+            settings, "snapshot_wait_ms", 1000U, true)},
+        std::chrono::milliseconds{optional_unsigned(
+            settings, "max_frame_age_ms", 500U)},
         optional_string(settings, "control_command", "capture"),
         optional_string(settings, "control_device", "auto"),
         controls);
@@ -182,6 +199,9 @@ CameraDriver::CameraDriver(
     std::chrono::milliseconds interval,
     unsigned int warmup_frames,
     int capture_timeout_ms,
+    SnapshotPolicy snapshot_policy,
+    std::chrono::milliseconds snapshot_wait,
+    std::chrono::milliseconds max_frame_age,
     std::string control_command,
     std::string control_device,
     camera_control_settings_t controls)
@@ -193,15 +213,21 @@ CameraDriver::CameraDriver(
       interval_(interval),
       warmup_frames_(warmup_frames),
       capture_timeout_ms_(capture_timeout_ms),
+      snapshot_policy_(snapshot_policy),
+      snapshot_wait_(snapshot_wait),
+      max_frame_age_(max_frame_age),
       control_command_(std::move(control_command)),
       control_device_(std::move(control_device)),
       controls_(controls) {
     capture_.fd = -1;
     capture_.control_fd = -1;
+    capture_.cancel_fd = -1;
     if (device_path_.empty() || width_ == 0U || height_ == 0U ||
         interval_ <= std::chrono::milliseconds::zero() ||
-        capture_timeout_ms_ <= 0 || control_command_.empty() ||
-        control_device_.empty()) {
+        capture_timeout_ms_ <= 0 ||
+        snapshot_wait_ <= std::chrono::milliseconds::zero() ||
+        max_frame_age_ < std::chrono::milliseconds::zero() ||
+        control_command_.empty() || control_device_.empty()) {
         throw std::invalid_argument("invalid camera driver settings");
     }
 }
@@ -215,7 +241,7 @@ DriverCapabilities CameraDriver::capabilities() const {
 }
 
 void CameraDriver::configure(const DeviceConfig& device, SampleSink sink) {
-    if (started_) {
+    if (started_.load(std::memory_order_acquire)) {
         throw std::logic_error("cannot configure a running camera driver");
     }
     if (!sink) {
@@ -239,92 +265,227 @@ void CameraDriver::start() {
     if (!configured_) {
         throw std::logic_error("camera driver is not configured");
     }
-    if (started_) {
+    if (started_.load(std::memory_order_acquire)) {
         throw std::logic_error("camera driver is already started");
     }
+
     {
-        std::lock_guard lock(capture_mutex_);
-        if (camera_capture_init(&capture_, device_path_.c_str(), width_, height_,
-                                pixel_format_, warmup_frames_,
-                                capture_timeout_ms_, control_device_.c_str(),
-                                &controls_) < 0) {
-            throw std::runtime_error(
-                "cannot start camera " + device_path_ + ": " +
-                std::strerror(errno));
-        }
+        std::lock_guard lock(latest_mutex_);
+        camera_frame_release(&latest_frame_);
+        latest_sequence_ = 0U;
+        latest_source_time_ns_ = 0;
+        latest_received_at_ = {};
+        latest_error_.clear();
     }
-    started_ = true;
-    if (mode_ == Mode::Periodic) {
-        worker_ = std::jthread(
-            [this](std::stop_token token) { run(token); });
+    if (camera_capture_init(&capture_, device_path_.c_str(), width_, height_,
+                            pixel_format_, warmup_frames_, capture_timeout_ms_,
+                            control_device_.c_str(), &controls_) < 0) {
+        throw std::runtime_error(
+            "cannot start camera " + device_path_ + ": " +
+            std::strerror(errno));
+    }
+
+    started_.store(true, std::memory_order_release);
+    try {
+        capture_worker_ = std::jthread(
+            [this](std::stop_token token) { capture_loop(token); });
+        if (mode_ == Mode::Periodic) {
+            publish_worker_ = std::jthread(
+                [this](std::stop_token token) { publish_loop(token); });
+        }
+    } catch (...) {
+        stop();
+        throw;
     }
 }
 
 void CameraDriver::stop() noexcept {
-    if (worker_.joinable()) {
-        worker_.request_stop();
-        wakeup_.notify_all();
-        worker_.join();
+    const bool was_started = started_.exchange(false, std::memory_order_acq_rel);
+    if (publish_worker_.joinable()) {
+        publish_worker_.request_stop();
     }
-    std::lock_guard lock(capture_mutex_);
+    if (capture_worker_.joinable()) {
+        capture_worker_.request_stop();
+    }
+    wakeup_.notify_all();
+    latest_ready_.notify_all();
+    if (was_started || capture_.fd >= 0) {
+        camera_capture_cancel(&capture_);
+    }
+    if (publish_worker_.joinable()) {
+        publish_worker_.join();
+    }
+    if (capture_worker_.joinable()) {
+        capture_worker_.join();
+    }
     camera_capture_close(&capture_);
-    started_ = false;
+    {
+        std::lock_guard lock(latest_mutex_);
+        camera_frame_release(&latest_frame_);
+        latest_sequence_ = 0U;
+        latest_source_time_ns_ = 0;
+        latest_received_at_ = {};
+        latest_error_.clear();
+    }
 }
 
-ByteArray CameraDriver::capture_one() {
+void CameraDriver::capture_loop(std::stop_token stop_token) noexcept {
+    camera_frame_t incoming{};
+    while (!stop_token.stop_requested()) {
+        if (camera_capture_read_reuse(&capture_, &incoming) < 0) {
+            const int saved = errno;
+            if (stop_token.stop_requested() || saved == ECANCELED) {
+                break;
+            }
+            {
+                std::lock_guard lock(latest_mutex_);
+                latest_error_ = std::strerror(saved);
+            }
+            latest_ready_.notify_all();
+            std::cerr << "[camera] streaming capture failed: "
+                      << std::strerror(saved) << " (" << saved << ")\n";
+            std::unique_lock retry_lock(wait_mutex_);
+            if (wakeup_.wait_for(
+                    retry_lock, std::chrono::milliseconds{100},
+                    [&stop_token] { return stop_token.stop_requested(); })) {
+                break;
+            }
+            continue;
+        }
+
+        const auto received_at = ControlClock::now();
+        const auto source_time_ns = unix_time_ns();
+        {
+            std::lock_guard lock(latest_mutex_);
+            std::swap(latest_frame_, incoming);
+            ++latest_sequence_;
+            latest_source_time_ns_ = source_time_ns;
+            latest_received_at_ = received_at;
+            latest_error_.clear();
+        }
+        latest_ready_.notify_all();
+    }
+    camera_frame_release(&incoming);
+    latest_ready_.notify_all();
+}
+
+CameraDriver::CapturedImage CameraDriver::capture_snapshot(
+    ControlClock::time_point deadline) {
+    const auto local_deadline = ControlClock::now() + snapshot_wait_;
+    if (deadline > local_deadline) {
+        deadline = local_deadline;
+    }
+
     camera_frame_t frame{};
-    uint8_t* image = nullptr;
+    ByteArray raw_frame;
+    std::uint64_t sequence = 0U;
+    std::int64_t source_time_ns = 0;
+    {
+        std::unique_lock lock(latest_mutex_);
+        const std::uint64_t baseline = latest_sequence_;
+        const auto ready = [this, baseline] {
+            if (!started_.load(std::memory_order_acquire) ||
+                latest_frame_.data == nullptr || latest_frame_.size == 0U) {
+                return !started_.load(std::memory_order_acquire);
+            }
+            if (snapshot_policy_ == SnapshotPolicy::Next &&
+                latest_sequence_ <= baseline) {
+                return false;
+            }
+            if (max_frame_age_ > std::chrono::milliseconds::zero() &&
+                ControlClock::now() - latest_received_at_ > max_frame_age_) {
+                return false;
+            }
+            return true;
+        };
+
+        if (!ready() && !latest_ready_.wait_until(lock, deadline, ready)) {
+            const std::string detail = latest_error_.empty()
+                ? std::string{}
+                : std::string{"; last streaming error: "} + latest_error_;
+            throw std::system_error(
+                std::error_code(ETIMEDOUT, std::generic_category()),
+                "wait for camera snapshot" + detail);
+        }
+        if (!started_.load(std::memory_order_acquire)) {
+            throw std::system_error(ECANCELED, std::generic_category(),
+                                    "camera stopped while waiting for snapshot");
+        }
+
+        frame = latest_frame_;
+        raw_frame.assign(latest_frame_.data,
+                         latest_frame_.data + latest_frame_.size);
+        frame.data = raw_frame.data();
+        frame.capacity = raw_frame.size();
+        sequence = latest_sequence_;
+        source_time_ns = latest_source_time_ns_;
+    }
+
+    if (frame.pixfmt == V4L2_PIX_FMT_MJPEG) {
+        return CapturedImage{
+            .bytes = std::move(raw_frame),
+            .source_time_ns = source_time_ns,
+            .sequence = sequence,
+        };
+    }
+
+    size_t image_capacity = 0U;
     size_t image_size = 0U;
     uint32_t image_format = 0U;
-    if (camera_capture_read(&capture_, &frame) < 0) {
+    if (camera_frame_image_capacity(&frame, &image_capacity) < 0) {
         throw std::system_error(errno, std::generic_category(),
-                                "capture frame");
+                                "size camera snapshot");
     }
-    if (camera_frame_to_image(&frame, &image, &image_size, &image_format) < 0) {
-        const int saved = errno;
-        camera_frame_release(&frame);
-        throw std::system_error(saved, std::generic_category(),
-                                "convert camera frame");
+    ByteArray result(image_capacity);
+    if (camera_frame_to_image_buffer(&frame, result.data(), result.size(),
+                                     &image_size, &image_format) < 0) {
+        throw std::system_error(errno, std::generic_category(),
+                                "convert camera snapshot");
     }
     (void)image_format;
-    ByteArray result(image, image + image_size);
-    free(image);
-    camera_frame_release(&frame);
-    return result;
+    result.resize(image_size);
+    return CapturedImage{
+        .bytes = std::move(result),
+        .source_time_ns = source_time_ns,
+        .sequence = sequence,
+    };
 }
 
-EnqueueResult CameraDriver::emit_frame(ByteArray&& image) {
+EnqueueResult CameraDriver::emit_frame(CapturedImage&& image) {
     RawBatch batch{
         .device_id = device_.id,
         .source = "camera",
         .samples = {},
     };
-    const auto timestamp = unix_time_ns();
     batch.samples.reserve(device_.points.size());
-    for (const auto& point : device_.points) {
+    for (std::size_t index = 0U; index < device_.points.size(); ++index) {
+        ByteArray value = index + 1U == device_.points.size()
+            ? std::move(image.bytes)
+            : image.bytes;
         batch.samples.push_back(RawSample{
-            .point = point.name,
-            .value = image,
+            .point = device_.points[index].name,
+            .value = std::move(value),
             .status = Quality::Good,
-            .source_time_ns = timestamp,
+            .source_time_ns = image.source_time_ns,
         });
     }
     return sink_(std::move(batch));
 }
 
-void CameraDriver::run(std::stop_token stop_token) noexcept {
+void CameraDriver::publish_loop(std::stop_token stop_token) noexcept {
     while (!stop_token.stop_requested()) {
         try {
-            ByteArray image;
-            {
-                std::lock_guard lock(capture_mutex_);
-                image = capture_one();
-            }
+            auto image = capture_snapshot(ControlClock::time_point::max());
             if (emit_frame(std::move(image)) == EnqueueResult::Stopping) {
                 return;
             }
+        } catch (const std::system_error& error) {
+            if (stop_token.stop_requested() || error.code().value() == ECANCELED) {
+                return;
+            }
+            std::cerr << "[camera] snapshot failed: " << error.what() << '\n';
         } catch (const std::exception& error) {
-            std::cerr << "[camera] capture failed: " << error.what() << '\n';
+            std::cerr << "[camera] snapshot failed: " << error.what() << '\n';
         }
         std::unique_lock lock(wait_mutex_);
         if (wakeup_.wait_for(lock, interval_,
@@ -352,21 +513,20 @@ DeviceControlResult CameraDriver::control(
         return failed(DeviceControlStatus::Unsupported,
                       "unsupported camera command: " + request.command);
     }
-    if (!started_) {
+    if (!started_.load(std::memory_order_acquire)) {
         return failed(DeviceControlStatus::Failed, "camera is stopped");
     }
     if (ControlClock::now() >= request.deadline) {
-        return failed(DeviceControlStatus::Timeout, "camera control deadline expired");
+        return failed(DeviceControlStatus::Timeout,
+                      "camera control deadline expired");
     }
+
     try {
-        ByteArray image;
-        {
-            std::lock_guard lock(capture_mutex_);
-            image = capture_one();
-        }
+        auto image = capture_snapshot(request.deadline);
+        const auto sequence = image.sequence;
         if (ControlClock::now() >= request.deadline) {
             return failed(DeviceControlStatus::Timeout,
-                          "camera capture exceeded control deadline");
+                          "camera snapshot conversion exceeded control deadline");
         }
         const auto enqueue_result = emit_frame(std::move(image));
         if (enqueue_result == EnqueueResult::Stopping) {
@@ -376,12 +536,18 @@ DeviceControlResult CameraDriver::control(
         return DeviceControlResult{
             .request_id = request.request_id,
             .status = DeviceControlStatus::Succeeded,
-            .outputs = {},
-            .message = "camera frame captured and pushed",
+            .outputs = {{"frame_sequence", static_cast<std::int64_t>(sequence)}},
+            .message = "latest camera frame pushed",
         };
     } catch (const std::system_error& error) {
+        if (error.code().value() == ETIMEDOUT) {
+            return failed(DeviceControlStatus::Timeout, error.what());
+        }
+        if (error.code().value() == ECANCELED) {
+            return failed(DeviceControlStatus::Cancelled, error.what());
+        }
         return failed(DeviceControlStatus::Failed,
-                      std::string{"camera capture failed: "} + error.what());
+                      std::string{"camera snapshot failed: "} + error.what());
     } catch (const std::exception& error) {
         return failed(DeviceControlStatus::Failed, error.what());
     }

@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <strings.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -367,12 +368,16 @@ void camera_capture_close(camera_capture_t *capture)
     if (capture->control_fd >= 0) {
         (void)close(capture->control_fd);
     }
+    if (capture->cancel_fd >= 0) {
+        (void)close(capture->cancel_fd);
+    }
     if (capture->fd >= 0) {
         (void)close(capture->fd);
     }
     memset(capture, 0, sizeof(*capture));
     capture->fd = -1;
     capture->control_fd = -1;
+    capture->cancel_fd = -1;
 }
 
 int camera_capture_init(
@@ -402,6 +407,7 @@ int camera_capture_init(
     memset(capture, 0, sizeof(*capture));
     capture->fd = -1;
     capture->control_fd = -1;
+    capture->cancel_fd = -1;
     memset(&capture->controls, 0, sizeof(capture->controls));
     if (controls != NULL) {
         capture->controls = *controls;
@@ -409,6 +415,12 @@ int camera_capture_init(
     capture->fd = open(device, O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (capture->fd < 0) {
         return -1;
+    }
+    capture->cancel_fd = eventfd(0U, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (capture->cancel_fd < 0) {
+        const int saved = errno;
+        camera_capture_close(capture);
+        return set_errno(saved);
     }
 
     memset(&capability, 0, sizeof(capability));
@@ -600,13 +612,18 @@ int camera_capture_init(
 
 static int wait_for_frame(camera_capture_t *capture)
 {
-    struct pollfd descriptor;
+    struct pollfd descriptors[2];
     int result;
-    descriptor.fd = capture->fd;
-    descriptor.events = POLLIN | POLLPRI;
-    descriptor.revents = 0;
+    uint64_t value;
+
+    descriptors[0].fd = capture->fd;
+    descriptors[0].events = POLLIN | POLLPRI;
+    descriptors[0].revents = 0;
+    descriptors[1].fd = capture->cancel_fd;
+    descriptors[1].events = POLLIN;
+    descriptors[1].revents = 0;
     do {
-        result = poll(&descriptor, 1, capture->timeout_ms);
+        result = poll(descriptors, 2, capture->timeout_ms);
     } while (result < 0 && errno == EINTR);
     if (result == 0) {
         return set_errno(ETIMEDOUT);
@@ -614,10 +631,33 @@ static int wait_for_frame(camera_capture_t *capture)
     if (result < 0) {
         return -1;
     }
-    if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+    if ((descriptors[1].revents & POLLIN) != 0) {
+        const ssize_t read_result =
+            read(capture->cancel_fd, &value, sizeof(value));
+        if (read_result < 0 && errno != EAGAIN) {
+            return -1;
+        }
+        return set_errno(ECANCELED);
+    }
+    if ((descriptors[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+        return set_errno(EIO);
+    }
+    if ((descriptors[0].revents & (POLLIN | POLLPRI)) == 0) {
         return set_errno(EIO);
     }
     return 0;
+}
+
+void camera_capture_cancel(camera_capture_t *capture)
+{
+    const uint64_t value = 1U;
+    if (capture == NULL || capture->cancel_fd < 0) {
+        return;
+    }
+    if (write(capture->cancel_fd, &value, sizeof(value)) < 0 &&
+        errno != EAGAIN) {
+        return;
+    }
 }
 
 static int dequeue_buffer(camera_capture_t *capture,
@@ -651,7 +691,8 @@ static int discard_one(camera_capture_t *capture)
     return queue_buffer(capture, buffer.index, planes);
 }
 
-int camera_capture_read(camera_capture_t *capture, camera_frame_t *frame)
+static int camera_capture_read_internal(camera_capture_t *capture,
+                                        camera_frame_t *frame, int reuse)
 {
     struct v4l2_buffer buffer;
     struct v4l2_plane planes[VIDEO_MAX_PLANES];
@@ -665,7 +706,19 @@ int camera_capture_read(camera_capture_t *capture, camera_frame_t *frame)
         !capture->streaming) {
         return set_errno(EINVAL);
     }
-    memset(frame, 0, sizeof(*frame));
+    if (!reuse) {
+        memset(frame, 0, sizeof(*frame));
+    } else {
+        frame->size = 0U;
+        frame->width = 0U;
+        frame->height = 0U;
+        frame->bytesperline = 0U;
+        frame->plane_count = 0U;
+        frame->pixfmt = 0U;
+        memset(frame->plane_offset, 0, sizeof(frame->plane_offset));
+        memset(frame->plane_bytesperline, 0,
+               sizeof(frame->plane_bytesperline));
+    }
     for (index = 0U; index < capture->warmup_frames; ++index) {
         if (wait_for_frame(capture) < 0 || discard_one(capture) < 0) {
             return -1;
@@ -685,46 +738,56 @@ int camera_capture_read(camera_capture_t *capture, camera_frame_t *frame)
         }
     }
     if (buffer.index >= capture->buffer_count) {
-        const int saved = EIO;
-        return set_errno(saved);
+        return set_errno(EIO);
     }
 
     total_size = 0U;
     if (capture->buffer_type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
         for (plane = 0U; plane < capture->plane_count; ++plane) {
+            const size_t data_offset = planes[plane].data_offset;
             const size_t used = planes[plane].bytesused;
-            if (used == 0U || used > capture->buffers[buffer.index].length[plane] ||
-                total_size > SIZE_MAX - used) {
-                const int saved = EIO;
+            const size_t length = capture->buffers[buffer.index].length[plane];
+            if (used == 0U || data_offset > used || used > length ||
+                total_size > SIZE_MAX - (used - data_offset)) {
                 (void)queue_buffer(capture, buffer.index, planes);
-                return set_errno(saved);
+                return set_errno(EIO);
             }
-            total_size += used;
+            total_size += used - data_offset;
         }
     } else {
         if (buffer.bytesused == 0U ||
             (size_t)buffer.bytesused > capture->buffers[buffer.index].length[0]) {
-            const int saved = EIO;
             (void)queue_buffer(capture, buffer.index, planes);
-            return set_errno(saved);
+            return set_errno(EIO);
         }
         total_size = buffer.bytesused;
     }
 
-    copy = malloc(total_size);
-    if (copy == NULL) {
-        const int saved = errno;
-        (void)queue_buffer(capture, buffer.index, planes);
-        return set_errno(saved);
+    if (reuse && frame->capacity >= total_size) {
+        copy = frame->data;
+    } else {
+        copy = reuse ? realloc(frame->data, total_size) : malloc(total_size);
+        if (copy == NULL) {
+            const int saved = errno;
+            (void)queue_buffer(capture, buffer.index, planes);
+            return set_errno(saved);
+        }
+        frame->data = copy;
+        frame->capacity = total_size;
     }
+
     copy_offset = 0U;
     if (capture->buffer_type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
         for (plane = 0U; plane < capture->plane_count; ++plane) {
-            const size_t used = planes[plane].bytesused;
-            memcpy(copy + copy_offset, capture->buffers[buffer.index].start[plane],
-                   used);
+            const size_t data_offset = planes[plane].data_offset;
+            const size_t used = planes[plane].bytesused - data_offset;
+            const uint8_t *source =
+                (const uint8_t *)capture->buffers[buffer.index].start[plane] +
+                data_offset;
+            memcpy(copy + copy_offset, source, used);
             frame->plane_offset[plane] = copy_offset;
-            frame->plane_bytesperline[plane] = capture->plane_bytesperline[plane];
+            frame->plane_bytesperline[plane] =
+                capture->plane_bytesperline[plane];
             copy_offset += used;
         }
     } else {
@@ -733,12 +796,13 @@ int camera_capture_read(camera_capture_t *capture, camera_frame_t *frame)
         frame->plane_bytesperline[0] = capture->plane_bytesperline[0];
     }
     if (queue_buffer(capture, buffer.index, planes) < 0) {
-        const int saved = errno;
-        free(copy);
-        return set_errno(saved);
+        if (!reuse) {
+            free(frame->data);
+            memset(frame, 0, sizeof(*frame));
+        }
+        return -1;
     }
 
-    frame->data = copy;
     frame->size = total_size;
     frame->width = capture->width;
     frame->height = capture->height;
@@ -746,6 +810,16 @@ int camera_capture_read(camera_capture_t *capture, camera_frame_t *frame)
     frame->plane_count = capture->plane_count;
     frame->pixfmt = capture->pixfmt;
     return 0;
+}
+
+int camera_capture_read(camera_capture_t *capture, camera_frame_t *frame)
+{
+    return camera_capture_read_internal(capture, frame, 0);
+}
+
+int camera_capture_read_reuse(camera_capture_t *capture, camera_frame_t *frame)
+{
+    return camera_capture_read_internal(capture, frame, 1);
 }
 
 void camera_frame_release(camera_frame_t *frame)
@@ -803,12 +877,12 @@ static int frame_plane(const camera_frame_t *frame, unsigned int plane,
     return 0;
 }
 
-int camera_frame_to_image(const camera_frame_t *frame, uint8_t **data,
-                          size_t *size, uint32_t *image_format)
+int camera_frame_to_image_buffer(const camera_frame_t *frame, uint8_t *data,
+                                 size_t capacity, size_t *size,
+                                 uint32_t *image_format)
 {
     size_t output_size;
     size_t header_length;
-    uint8_t *output;
     unsigned int y;
     unsigned int x;
     const uint8_t *plane0;
@@ -822,15 +896,12 @@ int camera_frame_to_image(const camera_frame_t *frame, uint8_t **data,
         frame->data == NULL || frame->width == 0U || frame->height == 0U) {
         return set_errno(EINVAL);
     }
-    *data = NULL;
     *size = 0U;
     if (frame->pixfmt == V4L2_PIX_FMT_MJPEG) {
-        output = malloc(frame->size);
-        if (output == NULL) {
-            return -1;
+        if (capacity < frame->size) {
+            return set_errno(ENOSPC);
         }
-        memcpy(output, frame->data, frame->size);
-        *data = output;
+        memcpy(data, frame->data, frame->size);
         *size = frame->size;
         *image_format = V4L2_PIX_FMT_MJPEG;
         return 0;
@@ -838,31 +909,27 @@ int camera_frame_to_image(const camera_frame_t *frame, uint8_t **data,
     if (ppm_size(frame->width, frame->height, &output_size) < 0) {
         return -1;
     }
-    output = malloc(output_size);
-    if (output == NULL) {
-        return -1;
+    if (capacity < output_size) {
+        return set_errno(ENOSPC);
     }
-    header_length = (size_t)snprintf((char *)output, output_size,
-                                      "P6\n%u %u\n255\n",
-                                      frame->width, frame->height);
+    header_length = (size_t)snprintf((char *)data, output_size,
+                                     "P6\n%u %u\n255\n",
+                                     frame->width, frame->height);
     if (header_length >= output_size) {
-        free(output);
         return set_errno(EOVERFLOW);
     }
 
     if (frame_plane(frame, 0U, &plane0, &stride0) < 0) {
-        free(output);
         return -1;
     }
     if (frame->pixfmt == V4L2_PIX_FMT_YUYV) {
         if (stride0 < frame->width * 2U ||
             (size_t)stride0 * frame->height > frame->size) {
-            free(output);
             return set_errno(EIO);
         }
         for (y = 0U; y < frame->height; ++y) {
             const uint8_t *row = plane0 + (size_t)y * stride0;
-            uint8_t *dst = output + header_length +
+            uint8_t *dst = data + header_length +
                            (size_t)y * (size_t)frame->width * 3U;
             for (x = 0U; x + 1U < frame->width; x += 2U) {
                 yuv_to_rgb(row[x * 2U], row[x * 2U + 1U], row[x * 2U + 3U],
@@ -875,13 +942,11 @@ int camera_frame_to_image(const camera_frame_t *frame, uint8_t **data,
                frame->pixfmt == V4L2_PIX_FMT_NV12M) {
         if (frame->plane_count >= 2U) {
             if (frame_plane(frame, 1U, &plane1, &stride1) < 0) {
-                free(output);
                 return -1;
             }
         } else {
             const size_t uv_offset = (size_t)stride0 * frame->height;
             if (uv_offset >= frame->size) {
-                free(output);
                 return set_errno(EIO);
             }
             plane1 = frame->data + uv_offset;
@@ -889,18 +954,16 @@ int camera_frame_to_image(const camera_frame_t *frame, uint8_t **data,
         }
         if (stride0 < frame->width || stride1 < frame->width ||
             (size_t)stride0 * frame->height > frame->size) {
-            free(output);
             return set_errno(EIO);
         }
         for (y = 0U; y < frame->height; ++y) {
             const uint8_t *y_row = plane0 + (size_t)y * stride0;
             const uint8_t *uv_row = plane1 + (size_t)(y / 2U) * stride1;
-            uint8_t *dst = output + header_length +
+            uint8_t *dst = data + header_length +
                            (size_t)y * (size_t)frame->width * 3U;
             for (x = 0U; x < frame->width; ++x) {
                 const unsigned int uv_x = (x / 2U) * 2U;
                 if (uv_x + 1U >= stride1) {
-                    free(output);
                     return set_errno(EIO);
                 }
                 yuv_to_rgb(y_row[x], uv_row[uv_x], uv_row[uv_x + 1U],
@@ -912,7 +975,6 @@ int camera_frame_to_image(const camera_frame_t *frame, uint8_t **data,
         if (frame->plane_count >= 3U) {
             if (frame_plane(frame, 1U, &plane1, &stride1) < 0 ||
                 frame_plane(frame, 2U, &plane2, &stride2) < 0) {
-                free(output);
                 return -1;
             }
         } else {
@@ -922,7 +984,6 @@ int camera_frame_to_image(const camera_frame_t *frame, uint8_t **data,
                                     (size_t)chroma_stride *
                                         ((frame->height + 1U) / 2U);
             if (v_offset >= frame->size) {
-                free(output);
                 return set_errno(EIO);
             }
             plane1 = frame->data + u_offset;
@@ -933,14 +994,13 @@ int camera_frame_to_image(const camera_frame_t *frame, uint8_t **data,
         if (stride0 < frame->width ||
             stride1 < (frame->width + 1U) / 2U ||
             stride2 < (frame->width + 1U) / 2U) {
-            free(output);
             return set_errno(EIO);
         }
         for (y = 0U; y < frame->height; ++y) {
             const uint8_t *y_row = plane0 + (size_t)y * stride0;
             const uint8_t *u_row = plane1 + (size_t)(y / 2U) * stride1;
             const uint8_t *v_row = plane2 + (size_t)(y / 2U) * stride2;
-            uint8_t *dst = output + header_length +
+            uint8_t *dst = data + header_length +
                            (size_t)y * (size_t)frame->width * 3U;
             for (x = 0U; x < frame->width; ++x) {
                 yuv_to_rgb(y_row[x], u_row[x / 2U], v_row[x / 2U],
@@ -950,21 +1010,66 @@ int camera_frame_to_image(const camera_frame_t *frame, uint8_t **data,
     } else if (frame->pixfmt == V4L2_PIX_FMT_RGB24) {
         if (stride0 < frame->width * 3U ||
             (size_t)stride0 * frame->height > frame->size) {
-            free(output);
             return set_errno(EIO);
         }
         for (y = 0U; y < frame->height; ++y) {
-            memcpy(output + header_length +
+            memcpy(data + header_length +
                        (size_t)y * (size_t)frame->width * 3U,
                    plane0 + (size_t)y * stride0,
                    (size_t)frame->width * 3U);
         }
     } else {
-        free(output);
         return set_errno(ENOTSUP);
     }
-    *data = output;
     *size = header_length + (size_t)frame->width * (size_t)frame->height * 3U;
     *image_format = V4L2_PIX_FMT_RGB24;
+    return 0;
+}
+
+int camera_frame_image_capacity(const camera_frame_t *frame, size_t *capacity)
+{
+    if (frame == NULL || capacity == NULL || frame->data == NULL ||
+        frame->width == 0U || frame->height == 0U) {
+        return set_errno(EINVAL);
+    }
+    if (frame->pixfmt == V4L2_PIX_FMT_MJPEG) {
+        *capacity = frame->size;
+        return 0;
+    }
+    if (frame->pixfmt != V4L2_PIX_FMT_YUYV &&
+        frame->pixfmt != V4L2_PIX_FMT_NV12 &&
+        frame->pixfmt != V4L2_PIX_FMT_NV12M &&
+        frame->pixfmt != V4L2_PIX_FMT_YUV420 &&
+        frame->pixfmt != V4L2_PIX_FMT_YUV420M &&
+        frame->pixfmt != V4L2_PIX_FMT_RGB24) {
+        return set_errno(ENOTSUP);
+    }
+    return ppm_size(frame->width, frame->height, capacity);
+}
+
+int camera_frame_to_image(const camera_frame_t *frame, uint8_t **data,
+                          size_t *size, uint32_t *image_format)
+{
+    size_t capacity;
+    uint8_t *output;
+    if (data == NULL || size == NULL || image_format == NULL) {
+        return set_errno(EINVAL);
+    }
+    *data = NULL;
+    *size = 0U;
+    if (camera_frame_image_capacity(frame, &capacity) < 0) {
+        return -1;
+    }
+    output = malloc(capacity);
+    if (output == NULL) {
+        return -1;
+    }
+    if (camera_frame_to_image_buffer(frame, output, capacity, size,
+                                     image_format) < 0) {
+        const int saved = errno;
+        free(output);
+        return set_errno(saved);
+    }
+    *data = output;
     return 0;
 }

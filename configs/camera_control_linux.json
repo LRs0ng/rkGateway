@@ -17,6 +17,9 @@
         "mode": "control",
         "warmup_frames": 3,
         "capture_timeout_ms": 3000,
+        "snapshot_policy": "latest",
+        "snapshot_wait_ms": 1000,
+        "max_frame_age_ms": 500,
         "control_command": "capture"
       },
       "connection": {},

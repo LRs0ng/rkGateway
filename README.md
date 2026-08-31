@@ -219,6 +219,9 @@ RKISP 的 AE/3A 运行时可能再次覆盖手动曝光和增益，因此这些�
     "interval_ms": 10000,
     "warmup_frames": 3,
     "capture_timeout_ms": 3000,
+    "snapshot_policy": "latest",
+    "snapshot_wait_ms": 1000,
+    "max_frame_age_ms": 500,
     "control_command": "capture",
     "control_device": "auto",
     "exposure": 1000,
@@ -232,12 +235,25 @@ RKISP 的 AE/3A 运行时可能再次覆盖手动曝光和增益，因此这些�
 }
 ```
 
+camera plugin 启动后会始终保持 V4L2 `STREAMON`，后台采集线程持续执行
+`poll -> VIDIOC_DQBUF -> memcpy -> VIDIOC_QBUF`，并用两个可复用的用户空间帧缓冲交换“最新帧”。因此周期到达或收到 control 指令时不会重新打开摄像头、重新启动视频流或再次丢弃预热帧。
+
 `mode` 有两种值：
 
-- `periodic`：driver 启动后立即抓拍一帧，之后每隔 `interval_ms` 抓拍并通过 `SampleSink` 推送；
-- `control`：driver 启动并打开摄像头，但不主动抓拍；收到命令名为 `control_command`（默认 `capture`）的 `DeviceControlRequest` 后抓拍一次并推送一条 `RawBatch`。
+- `periodic`：后台视频流持续运行；driver 启动后取得第一张有效快照，之后每隔 `interval_ms` 从最新帧缓冲构造图片并通过 `SampleSink` 推送；
+- `control`：后台视频流同样持续运行，但只在收到命令名为 `control_command`（默认 `capture`）的 `DeviceControlRequest` 后从最新帧缓冲构造并推送一条 `RawBatch`。
 
-图片内容以 `gateway::ByteArray` 放在 point 的 `RawSample.value` 中，而不是仅传送文件路径。MJPEG 点中的字节是 JPEG 文件内容；NV12/YUYV/YUV420/RGB24 点中的字节是 PPM 文件内容。事件发布器需要支持 `ByteArray` 才能把图片转发到外部系统。
+快速快照参数：
+
+- `snapshot_policy: "latest"`：直接使用已经采集到的最新有效帧，控制延迟最低；
+- `snapshot_policy: "next"`：收到请求后等待下一帧，通常增加最多一个帧周期，但画面一定晚于请求时刻；
+- `snapshot_wait_ms`：等待第一帧或下一帧的插件内部上限；control 模式还会同时受请求自身的 `deadline` 限制；
+- `max_frame_age_ms`：`latest` 帧允许的最大年龄；设为 `0` 表示不检查年龄。持续流正常时建议保留约 100～500 ms；
+- `warmup_frames`：只在第一次 `STREAMON` 后丢弃一次，不会在每次抓拍时重复执行。
+
+V4L2 MMAP 缓冲在 `DQBUF` 后会尽快复制到插件自己的帧缓冲，然后立即 `QBUF`，不会把可能被驱动覆盖的 MMAP 地址直接放进异步 Event。1920×1080 NV12 最新帧缓冲约占 3.0 MiB；插件使用两个可复用缓冲，抓拍时再复制出稳定快照。
+
+图片内容以 `gateway::ByteArray` 放在 point 的 `RawSample.value` 中，而不是仅传送文件路径。MJPEG 点中的字节是 JPEG 文件内容，并直接由最新帧快照移动进 Event；NV12/YUYV/YUV420/RGB24 会在抓拍时直接写入最终 `ByteArray` 并形成 PPM，避免先生成临时 PPM 再做一次完整图片复制。事件发布器需要支持 `ByteArray` 才能把图片转发到外部系统。
 
 processor plugin 发送拍照指令时使用 miniGateway 的处理上下文，例如：
 

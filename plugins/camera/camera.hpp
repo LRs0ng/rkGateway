@@ -5,8 +5,10 @@
 
 #include "camera_capture.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -20,6 +22,11 @@ public:
         Control,
     };
 
+    enum class SnapshotPolicy {
+        Latest,
+        Next,
+    };
+
     CameraDriver(
         std::string device_path,
         unsigned int width,
@@ -29,6 +36,9 @@ public:
         std::chrono::milliseconds interval,
         unsigned int warmup_frames,
         int capture_timeout_ms,
+        SnapshotPolicy snapshot_policy,
+        std::chrono::milliseconds snapshot_wait,
+        std::chrono::milliseconds max_frame_age,
         std::string control_command,
         std::string control_device,
         camera_control_settings_t controls);
@@ -42,9 +52,17 @@ public:
         const DeviceControlRequest& request) override;
 
 private:
-    [[nodiscard]] ByteArray capture_one();
-    [[nodiscard]] EnqueueResult emit_frame(ByteArray&& image);
-    void run(std::stop_token stop_token) noexcept;
+    struct CapturedImage {
+        ByteArray bytes;
+        std::int64_t source_time_ns{0};
+        std::uint64_t sequence{0};
+    };
+
+    [[nodiscard]] CapturedImage capture_snapshot(
+        ControlClock::time_point deadline);
+    [[nodiscard]] EnqueueResult emit_frame(CapturedImage&& image);
+    void capture_loop(std::stop_token stop_token) noexcept;
+    void publish_loop(std::stop_token stop_token) noexcept;
 
     std::string device_path_;
     unsigned int width_;
@@ -54,6 +72,9 @@ private:
     std::chrono::milliseconds interval_;
     unsigned int warmup_frames_;
     int capture_timeout_ms_;
+    SnapshotPolicy snapshot_policy_;
+    std::chrono::milliseconds snapshot_wait_;
+    std::chrono::milliseconds max_frame_age_;
     std::string control_command_;
     std::string control_device_;
     camera_control_settings_t controls_{};
@@ -61,12 +82,21 @@ private:
     DeviceConfig device_;
     SampleSink sink_;
     camera_capture_t capture_{};
-    std::jthread worker_;
-    std::mutex capture_mutex_;
+    std::jthread capture_worker_;
+    std::jthread publish_worker_;
+
+    std::mutex latest_mutex_;
+    std::condition_variable latest_ready_;
+    camera_frame_t latest_frame_{};
+    std::uint64_t latest_sequence_{0};
+    std::int64_t latest_source_time_ns_{0};
+    ControlClock::time_point latest_received_at_{};
+    std::string latest_error_;
+
     std::mutex wait_mutex_;
     std::condition_variable_any wakeup_;
     bool configured_{false};
-    bool started_{false};
+    std::atomic_bool started_{false};
 };
 
 }  // namespace gateway
