@@ -176,6 +176,14 @@ ScreenEventPublisher::ScreenEventPublisher(std::string settings_json)
     image_height_ = optional_unsigned(settings, "image_height",
                                       rotated_quarter_turn ? 1080U : 1920U,
                                       true);
+    image_target_width_ = optional_unsigned(
+        settings, "image_target_width", rotated_quarter_turn ? 1080U : 0U);
+    image_target_height_ = optional_unsigned(
+        settings, "image_target_height", rotated_quarter_turn ? 1080U : 0U);
+    if ((image_target_width_ == 0U) != (image_target_height_ == 0U)) {
+        plugin_json::fail(kPluginName, "image_target_width/image_target_height",
+                          "must both be zero or both be positive");
+    }
     expected_width_ = optional_unsigned(settings, "expected_width", 1080U, true);
     expected_height_ = optional_unsigned(settings, "expected_height", 1920U, true);
     fit_image_ = optional_bool(settings, "fit_image", true);
@@ -297,9 +305,10 @@ EventPublishResult ScreenEventPublisher::publish(const Event& event)
     if (selected_image != nullptr && selected_image->quality == Quality::Good &&
         std::holds_alternative<ByteArray>(selected_image->value)) {
         const auto& bytes = std::get<ByteArray>(selected_image->value);
-        if (screen_fb_present_rotated(
+        if (screen_fb_present_rotated_to(
                 screen_, bytes.data(), bytes.size(), image_format_.c_str(),
-                image_width_, image_height_, fit_image_ ? 1 : 0, 0x000000U,
+                image_width_, image_height_, image_target_width_,
+                image_target_height_, fit_image_ ? 1 : 0, 0x000000U,
                 rotation_degrees_) < 0) {
             std::cerr << "screen publisher: display image failed: "
                       << std::strerror(errno) << "\n";

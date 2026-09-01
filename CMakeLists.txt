@@ -50,10 +50,60 @@ add_subdirectory(
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniGateway"
     "${CMAKE_CURRENT_BINARY_DIR}/miniGateway")
 
+# Rockchip librga is kept in this repository as arm64 Debian packages under
+# third_party/rga. Extract it into build/ so the cross build never writes into
+# the host sysroot and all deployable runtime files stay below build/.
+set(RGA_ROOT "" CACHE PATH
+    "Pre-extracted arm64 RGA root containing include/rga and lib/librga")
+set(RGA_PACKAGE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rga"
+    CACHE PATH "Directory containing the arm64 librga Debian packages")
+if(RGA_ROOT STREQUAL "")
+    find_program(DPKG_DEB_EXECUTABLE dpkg-deb REQUIRED)
+    set(RGA_STAGE_DIR "${CMAKE_CURRENT_BINARY_DIR}/rga-sysroot")
+    set(RGA_DEV_DEB "${RGA_PACKAGE_DIR}/librga-dev_2.2.0-1_arm64.deb")
+    set(RGA_RUNTIME_DEB "${RGA_PACKAGE_DIR}/librga2_2.2.0-1_arm64.deb")
+    if(NOT EXISTS "${RGA_DEV_DEB}" OR NOT EXISTS "${RGA_RUNTIME_DEB}")
+        message(FATAL_ERROR
+            "Rockchip RGA packages were not found. Set RGA_ROOT to an "
+            "extracted arm64 librga root or set RGA_PACKAGE_DIR. Missing: "
+            "${RGA_DEV_DEB}; ${RGA_RUNTIME_DEB}")
+    endif()
+    file(MAKE_DIRECTORY "${RGA_STAGE_DIR}")
+    execute_process(
+        COMMAND "${DPKG_DEB_EXECUTABLE}" -x "${RGA_RUNTIME_DEB}" "${RGA_STAGE_DIR}"
+        COMMAND_ERROR_IS_FATAL ANY)
+    execute_process(
+        COMMAND "${DPKG_DEB_EXECUTABLE}" -x "${RGA_DEV_DEB}" "${RGA_STAGE_DIR}"
+        COMMAND_ERROR_IS_FATAL ANY)
+    set(RGA_ROOT "${RGA_STAGE_DIR}/usr")
+endif()
+
+find_path(RGA_INCLUDE_DIR rga/im2d.h
+    PATHS "${RGA_ROOT}/include" NO_DEFAULT_PATH REQUIRED)
+find_library(RGA_LIBRARY NAMES rga
+    PATHS "${RGA_ROOT}/lib/aarch64-linux-gnu" "${RGA_ROOT}/lib"
+    NO_DEFAULT_PATH REQUIRED)
+add_library(RGA::RGA SHARED IMPORTED GLOBAL)
+set_target_properties(RGA::RGA PROPERTIES
+    IMPORTED_LOCATION "${RGA_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${RGA_INCLUDE_DIR}")
+
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/miniGateway")
+file(GLOB RGA_RUNTIME_LIBRARIES
+    "${RGA_ROOT}/lib/aarch64-linux-gnu/librga.so*")
+if(NOT RGA_RUNTIME_LIBRARIES)
+    message(FATAL_ERROR "No arm64 librga runtime library found below ${RGA_ROOT}")
+endif()
+file(COPY ${RGA_RUNTIME_LIBRARIES}
+    DESTINATION "${CMAKE_CURRENT_BINARY_DIR}/miniGateway"
+    FOLLOW_SYMLINK_CHAIN)
+
 add_library(camera_capture_support STATIC
     plugins/camera/camera_capture.c)
 target_include_directories(camera_capture_support PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/plugins/camera")
+target_link_libraries(camera_capture_support PUBLIC RGA::RGA)
 target_compile_options(camera_capture_support PRIVATE
     -Wall -Wextra -Wpedantic -Wconversion)
 
@@ -70,6 +120,7 @@ set_target_properties(gateway_camera PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/miniGateway"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/miniGateway"
     ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/miniGateway"
+    BUILD_RPATH "$ORIGIN"
     BUILD_RPATH_USE_ORIGIN ON
     INSTALL_RPATH "$ORIGIN")
 target_compile_options(gateway_camera PRIVATE
@@ -155,7 +206,10 @@ target_include_directories(camera_test PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/plugins/camera")
 target_link_libraries(camera_test PRIVATE camera_capture_support)
 set_target_properties(camera_test PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tools")
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tools"
+    BUILD_RPATH "$ORIGIN/../miniGateway"
+    BUILD_RPATH_USE_ORIGIN ON
+    INSTALL_RPATH "$ORIGIN/../miniGateway")
 target_compile_options(camera_test PRIVATE
     -Wall -Wextra -Wpedantic -Wconversion)
 

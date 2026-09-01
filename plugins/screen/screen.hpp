@@ -30,6 +30,8 @@ private:
     unsigned int rotation_degrees_{0};
     unsigned int image_width_{1080};
     unsigned int image_height_{1920};
+    unsigned int image_target_width_{0};
+    unsigned int image_target_height_{0};
     unsigned int expected_width_{1080};
     unsigned int expected_height_{1920};
     bool fit_image_{true};

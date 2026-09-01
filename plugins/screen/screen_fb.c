@@ -525,11 +525,13 @@ static uint32_t raw_pixel(const uint8_t *pixels, unsigned int width,
     }
 }
 
-int screen_fb_present_rotated(screen_fb_t *screen, const uint8_t *data, size_t size,
-                              const char *format, unsigned int width,
-                              unsigned int height, int fit,
-                              uint32_t background_rgb888,
-                              unsigned int rotation_degrees)
+int screen_fb_present_rotated_to(screen_fb_t *screen, const uint8_t *data,
+                                 size_t size, const char *format,
+                                 unsigned int width, unsigned int height,
+                                 unsigned int target_width,
+                                 unsigned int target_height, int fit,
+                                 uint32_t background_rgb888,
+                                 unsigned int rotation_degrees)
 {
     const uint8_t *pixels = data;
     size_t pixel_size = size;
@@ -538,6 +540,8 @@ int screen_fb_present_rotated(screen_fb_t *screen, const uint8_t *data, size_t s
     unsigned int source_height = height;
     unsigned int logical_width;
     unsigned int logical_height;
+    unsigned int target_box_width;
+    unsigned int target_box_height;
     unsigned int output_width;
     unsigned int output_height;
     unsigned int x;
@@ -551,6 +555,14 @@ int screen_fb_present_rotated(screen_fb_t *screen, const uint8_t *data, size_t s
         return set_errno_value(EINVAL);
     }
     logical_dimensions(screen, rotation_degrees, &logical_width, &logical_height);
+    if ((target_width == 0U) != (target_height == 0U)) {
+        return set_errno_value(EINVAL);
+    }
+    target_box_width = target_width == 0U ? logical_width : target_width;
+    target_box_height = target_height == 0U ? logical_height : target_height;
+    if (target_box_width > logical_width || target_box_height > logical_height) {
+        return set_errno_value(ERANGE);
+    }
     if (format == NULL || format[0] == '\0' || strcmp(format, "auto") == 0) {
         if (size >= 2U && data[0] == 'P' && data[1] == '6') {
             (void)snprintf(selected_format, sizeof(selected_format), "ppm");
@@ -587,8 +599,8 @@ int screen_fb_present_rotated(screen_fb_t *screen, const uint8_t *data, size_t s
     if (source_width == 0U || source_height == 0U) {
         return set_errno_value(EINVAL);
     }
-    output_width = logical_width;
-    output_height = logical_height;
+    output_width = target_box_width;
+    output_height = target_box_height;
     if (fit) {
         const uint64_t width_scale = (uint64_t)output_width * source_height;
         const uint64_t height_scale = (uint64_t)output_height * source_width;
@@ -627,6 +639,17 @@ int screen_fb_present_rotated(screen_fb_t *screen, const uint8_t *data, size_t s
         }
     }
     return flush_if_immediate(screen);
+}
+
+int screen_fb_present_rotated(screen_fb_t *screen, const uint8_t *data,
+                              size_t size, const char *format,
+                              unsigned int width, unsigned int height, int fit,
+                              uint32_t background_rgb888,
+                              unsigned int rotation_degrees)
+{
+    return screen_fb_present_rotated_to(
+        screen, data, size, format, width, height, 0U, 0U, fit,
+        background_rgb888, rotation_degrees);
 }
 
 int screen_fb_present(screen_fb_t *screen, const uint8_t *data, size_t size,

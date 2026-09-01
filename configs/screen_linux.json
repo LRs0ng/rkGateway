@@ -11,9 +11,15 @@
       "library": "./libgateway_camera.so",
       "driver_config": {
         "device": "/dev/video0",
-        "width": 1920,
-        "height": 1080,
-        "pixfmt": "auto",
+        "sensor_device": "auto",
+        "sensor_width": 1944,
+        "sensor_height": 1096,
+        "crop_width": 1080,
+        "crop_height": 1080,
+        "width": 640,
+        "height": 640,
+        "pixfmt": "nv12",
+        "rga_rgb24": true,
         "mode": "periodic",
         "interval_ms": 10000,
         "warmup_frames": 3,
@@ -51,9 +57,9 @@
         "expected_width": 1080,
         "expected_height": 1920,
         "image_point": "image",
-        "image_format": "auto",
-        "image_width": 1920,
-        "image_height": 1080,
+        "image_format": "rgb24",
+        "image_width": 640,
+        "image_height": 640,
         "fit_image": true,
         "numeric_scale": 1,
         "numeric_x": 0,
@@ -63,7 +69,9 @@
         "clear_before_numeric": true,
         "wait_for_vsync": true,
         "output_mode": "landscape",
-        "rotation_degrees": 90
+        "rotation_degrees": 90,
+        "image_target_width": 1080,
+        "image_target_height": 1080
       }
     }
   ],

@@ -4,7 +4,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/media-bus-format.h>
+#include <linux/v4l2-subdev.h>
 #include <poll.h>
+#include <rga/im2d.h>
 #include <stdint.h>
 #include <dirent.h>
 #include <ctype.h>
@@ -238,7 +241,7 @@ static int contains_case_insensitive(const char *text, const char *needle)
     return 0;
 }
 
-static int open_auto_control_device(void)
+static int open_auto_sensor_device(void)
 {
     DIR *directory;
     struct dirent *entry;
@@ -286,20 +289,108 @@ static int open_auto_control_device(void)
     return set_errno(ENODEV);
 }
 
+static int open_sensor_device(const char *sensor_device)
+{
+    if (sensor_device == NULL || sensor_device[0] == '\0' ||
+        strcasecmp(sensor_device, "auto") == 0) {
+        return open_auto_sensor_device();
+    }
+    if (strcasecmp(sensor_device, "none") == 0) {
+        return set_errno(ENODEV);
+    }
+    return open(sensor_device, O_RDWR | O_CLOEXEC);
+}
+
 static int open_control_device(const char *control_device,
-                               int need_sensor_controls)
+                               int need_sensor_controls,
+                               int sensor_fd)
 {
     if (!need_sensor_controls) {
         return -1;
     }
     if (control_device == NULL || control_device[0] == '\0' ||
         strcasecmp(control_device, "auto") == 0) {
-        return open_auto_control_device();
+        if (sensor_fd >= 0) {
+            return dup(sensor_fd);
+        }
+        return open_auto_sensor_device();
     }
     if (strcasecmp(control_device, "none") == 0) {
         return set_errno(ENODEV);
     }
     return open(control_device, O_RDWR | O_CLOEXEC);
+}
+
+static int configure_sensor_format(int fd, unsigned int width,
+                                   unsigned int height)
+{
+    struct v4l2_subdev_format format;
+
+    memset(&format, 0, sizeof(format));
+    format.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+    format.pad = 0U;
+    format.format.width = width;
+    format.format.height = height;
+    format.format.code = MEDIA_BUS_FMT_SGBRG10_1X10;
+    format.format.field = V4L2_FIELD_NONE;
+    if (xioctl(fd, VIDIOC_SUBDEV_S_FMT, &format) < 0) {
+        return -1;
+    }
+    if (format.format.width != width || format.format.height != height ||
+        format.format.code != MEDIA_BUS_FMT_SGBRG10_1X10) {
+        return set_errno(ERANGE);
+    }
+    return 0;
+}
+
+static int configure_center_crop(camera_capture_t *capture,
+                                 unsigned int crop_width,
+                                 unsigned int crop_height)
+{
+    struct v4l2_selection selection;
+    struct v4l2_rect bounds;
+    unsigned int centered_left;
+    unsigned int centered_top;
+
+    memset(&selection, 0, sizeof(selection));
+    selection.type = capture->buffer_type;
+    selection.target = V4L2_SEL_TGT_CROP_BOUNDS;
+    if (xioctl(capture->fd, VIDIOC_G_SELECTION, &selection) < 0) {
+        return -1;
+    }
+    bounds = selection.r;
+    if (bounds.left < 0 || bounds.top < 0 ||
+        bounds.width < crop_width || bounds.height < crop_height) {
+        return set_errno(ERANGE);
+    }
+
+    centered_left = (unsigned int)bounds.left +
+                    ((unsigned int)bounds.width - crop_width) / 2U;
+    centered_top = (unsigned int)bounds.top +
+                   ((unsigned int)bounds.height - crop_height) / 2U;
+    centered_left &= ~1U;
+    centered_top &= ~1U;
+
+    memset(&selection, 0, sizeof(selection));
+    selection.type = capture->buffer_type;
+    selection.target = V4L2_SEL_TGT_CROP;
+    selection.r.left = (int32_t)centered_left;
+    selection.r.top = (int32_t)centered_top;
+    selection.r.width = crop_width;
+    selection.r.height = crop_height;
+    if (xioctl(capture->fd, VIDIOC_S_SELECTION, &selection) < 0) {
+        return -1;
+    }
+    if (selection.r.left < 0 || selection.r.top < 0 ||
+        selection.r.width != crop_width ||
+        selection.r.height != crop_height) {
+        return set_errno(ERANGE);
+    }
+    capture->crop_left = (unsigned int)selection.r.left;
+    capture->crop_top = (unsigned int)selection.r.top;
+    capture->crop_width = (unsigned int)selection.r.width;
+    capture->crop_height = (unsigned int)selection.r.height;
+    return 0;
 }
 
 static int apply_camera_controls(camera_capture_t *capture)
@@ -314,11 +405,20 @@ static int apply_camera_controls(camera_capture_t *capture)
             result = set_v4l2_control(capture->control_fd, V4L2_CID_BRIGHTNESS,
                                       capture->controls.brightness, "brightness");
         }
+        if (result < 0 && capture->sensor_fd >= 0 &&
+            capture->control_fd < 0 &&
+            (errno == EINVAL || errno == ENOTTY || errno == ENOTSUP)) {
+            result = set_v4l2_control(capture->sensor_fd, V4L2_CID_BRIGHTNESS,
+                                      capture->controls.brightness, "brightness");
+        }
         if (result < 0) {
             return -1;
         }
     }
     target_fd = capture->control_fd >= 0 ? capture->control_fd : capture->fd;
+    if (capture->control_fd < 0 && capture->sensor_fd >= 0) {
+        target_fd = capture->sensor_fd;
+    }
     if (capture->controls.has_exposure &&
         set_v4l2_control(target_fd, V4L2_CID_EXPOSURE,
                          capture->controls.exposure, "exposure") < 0) {
@@ -368,6 +468,9 @@ void camera_capture_close(camera_capture_t *capture)
     if (capture->control_fd >= 0) {
         (void)close(capture->control_fd);
     }
+    if (capture->sensor_fd >= 0) {
+        (void)close(capture->sensor_fd);
+    }
     if (capture->cancel_fd >= 0) {
         (void)close(capture->cancel_fd);
     }
@@ -376,6 +479,7 @@ void camera_capture_close(camera_capture_t *capture)
     }
     memset(capture, 0, sizeof(*capture));
     capture->fd = -1;
+    capture->sensor_fd = -1;
     capture->control_fd = -1;
     capture->cancel_fd = -1;
 }
@@ -391,6 +495,23 @@ int camera_capture_init(
     const char *control_device,
     const camera_control_settings_t *controls)
 {
+    return camera_capture_init_ex(capture, device, width, height,
+                                  requested_format, warmup_frames, timeout_ms,
+                                  control_device, controls, NULL);
+}
+
+int camera_capture_init_ex(
+    camera_capture_t *capture,
+    const char *device,
+    unsigned int width,
+    unsigned int height,
+    camera_pixel_format_t requested_format,
+    unsigned int warmup_frames,
+    int timeout_ms,
+    const char *control_device,
+    const camera_control_settings_t *controls,
+    const camera_pipeline_settings_t *pipeline)
+{
     struct v4l2_capability capability;
     struct v4l2_format format;
     struct v4l2_requestbuffers request;
@@ -400,21 +521,52 @@ int camera_capture_init(
     unsigned int plane;
     uint32_t device_capabilities;
 
+    const int use_pipeline = pipeline != NULL;
+
     if (capture == NULL || device == NULL || device[0] == '\0' ||
         width == 0U || height == 0U || timeout_ms <= 0) {
         return set_errno(EINVAL);
     }
+    if (use_pipeline &&
+        (pipeline->sensor_width == 0U || pipeline->sensor_height == 0U ||
+         pipeline->crop_width == 0U || pipeline->crop_height == 0U ||
+         pipeline->crop_width > pipeline->sensor_width ||
+         pipeline->crop_height > pipeline->sensor_height)) {
+        return set_errno(EINVAL);
+    }
+    if (use_pipeline && pipeline->rga_rgb24 &&
+        requested_format != CAMERA_PIXFMT_AUTO &&
+        requested_format != CAMERA_PIXFMT_NV12) {
+        return set_errno(EINVAL);
+    }
     memset(capture, 0, sizeof(*capture));
     capture->fd = -1;
+    capture->sensor_fd = -1;
     capture->control_fd = -1;
     capture->cancel_fd = -1;
     memset(&capture->controls, 0, sizeof(capture->controls));
     if (controls != NULL) {
         capture->controls = *controls;
     }
+    if (use_pipeline) {
+        capture->sensor_fd = open_sensor_device(pipeline->sensor_device);
+        if (capture->sensor_fd < 0) {
+            return -1;
+        }
+        if (configure_sensor_format(capture->sensor_fd,
+                                    pipeline->sensor_width,
+                                    pipeline->sensor_height) < 0) {
+            const int saved = errno;
+            camera_capture_close(capture);
+            return set_errno(saved);
+        }
+        capture->rga_rgb24 = pipeline->rga_rgb24 != 0;
+    }
     capture->fd = open(device, O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (capture->fd < 0) {
-        return -1;
+        const int saved = errno;
+        camera_capture_close(capture);
+        return set_errno(saved);
     }
     capture->cancel_fd = eventfd(0U, EFD_NONBLOCK | EFD_CLOEXEC);
     if (capture->cancel_fd < 0) {
@@ -447,7 +599,16 @@ int camera_capture_init(
     }
     capture->buffer_type = type;
 
-    fourcc = requested_fourcc(requested_format);
+    if (use_pipeline &&
+        configure_center_crop(capture, pipeline->crop_width,
+                              pipeline->crop_height) < 0) {
+        const int saved = errno;
+        camera_capture_close(capture);
+        return set_errno(saved);
+    }
+
+    fourcc = capture->rga_rgb24 ? V4L2_PIX_FMT_NV12
+                                : requested_fourcc(requested_format);
     if (fourcc == 0U && choose_auto_format(capture->fd, type, &fourcc) < 0) {
         const int saved = errno;
         camera_capture_close(capture);
@@ -504,9 +665,17 @@ int camera_capture_init(
         capture->plane_bytesperline[0] = format.fmt.pix.bytesperline;
     }
     capture->bytesperline = capture->plane_bytesperline[0];
+    if (capture->rga_rgb24 &&
+        (capture->width != width || capture->height != height ||
+         capture->pixfmt != V4L2_PIX_FMT_NV12 || capture->plane_count != 1U ||
+         capture->bytesperline < capture->width)) {
+        camera_capture_close(capture);
+        return set_errno(ERANGE);
+    }
     capture->control_fd = open_control_device(
         control_device,
-        capture->controls.has_exposure || capture->controls.has_analogue_gain);
+        capture->controls.has_exposure || capture->controls.has_analogue_gain,
+        capture->sensor_fd);
     if ((capture->controls.has_exposure || capture->controls.has_analogue_gain) &&
         capture->control_fd < 0) {
         const int saved = errno;
@@ -691,6 +860,106 @@ static int discard_one(camera_capture_t *capture)
     return queue_buffer(capture, buffer.index, planes);
 }
 
+static int ensure_frame_capacity(camera_frame_t *frame, size_t size, int reuse)
+{
+    uint8_t *storage;
+
+    if (reuse && frame->data != NULL && frame->capacity >= size) {
+        return 0;
+    }
+    storage = reuse ? realloc(frame->data, size) : malloc(size);
+    if (storage == NULL) {
+        return -1;
+    }
+    frame->data = storage;
+    frame->capacity = size;
+    return 0;
+}
+
+static int convert_nv12_to_rgb24_rga(camera_capture_t *capture,
+                                     camera_frame_t *frame,
+                                     const struct v4l2_buffer *buffer,
+                                     const struct v4l2_plane *planes,
+                                     int reuse)
+{
+    const uint8_t *source;
+    size_t source_size;
+    size_t required_source_size;
+    size_t output_size;
+    rga_buffer_t source_buffer;
+    rga_buffer_t destination_buffer;
+    IM_STATUS status;
+
+    if (capture->pixfmt != V4L2_PIX_FMT_NV12 ||
+        capture->plane_count != 1U || capture->bytesperline < capture->width ||
+        capture->width > (unsigned int)INT_MAX ||
+        capture->height > (unsigned int)INT_MAX ||
+        capture->bytesperline > (unsigned int)INT_MAX ||
+        (capture->width & 1U) != 0U || (capture->height & 1U) != 0U) {
+        return set_errno(ENOTSUP);
+    }
+    if ((size_t)capture->bytesperline > SIZE_MAX / capture->height) {
+        return set_errno(EOVERFLOW);
+    }
+    required_source_size = (size_t)capture->bytesperline * capture->height;
+    if (required_source_size > SIZE_MAX - required_source_size / 2U) {
+        return set_errno(EOVERFLOW);
+    }
+    required_source_size += required_source_size / 2U;
+
+    if (capture->buffer_type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+        const size_t data_offset = planes[0].data_offset;
+        const size_t used = planes[0].bytesused;
+        if (data_offset > used ||
+            used > capture->buffers[buffer->index].length[0]) {
+            return set_errno(EIO);
+        }
+        source = (const uint8_t *)capture->buffers[buffer->index].start[0] +
+                 data_offset;
+        source_size = used - data_offset;
+    } else {
+        source = (const uint8_t *)capture->buffers[buffer->index].start[0];
+        source_size = buffer->bytesused;
+    }
+    if (source_size < required_source_size) {
+        return set_errno(EIO);
+    }
+    if ((size_t)capture->width > SIZE_MAX / capture->height ||
+        (size_t)capture->width * capture->height > SIZE_MAX / 3U) {
+        return set_errno(EOVERFLOW);
+    }
+    output_size = (size_t)capture->width * capture->height * 3U;
+    if (ensure_frame_capacity(frame, output_size, reuse) < 0) {
+        return -1;
+    }
+
+    source_buffer = wrapbuffer_virtualaddr_t(
+        (void *)source, (int)capture->width, (int)capture->height,
+        (int)capture->bytesperline, (int)capture->height,
+        RK_FORMAT_YCbCr_420_SP);
+    destination_buffer = wrapbuffer_virtualaddr_t(
+        frame->data, (int)capture->width, (int)capture->height,
+        (int)capture->width, (int)capture->height, RK_FORMAT_RGB_888);
+    status = imcvtcolor_t(source_buffer, destination_buffer,
+                          RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888,
+                          IM_YUV_TO_RGB_BT601_FULL, 1);
+    if (status != IM_STATUS_SUCCESS && status != IM_STATUS_NOERROR) {
+        fprintf(stderr, "camera: RGA NV12 to RGB24 failed: %s (%d)\n",
+                imStrError_t(status), (int)status);
+        return set_errno(EIO);
+    }
+
+    frame->size = output_size;
+    frame->width = capture->width;
+    frame->height = capture->height;
+    frame->bytesperline = capture->width * 3U;
+    frame->plane_count = 1U;
+    frame->plane_offset[0] = 0U;
+    frame->plane_bytesperline[0] = frame->bytesperline;
+    frame->pixfmt = V4L2_PIX_FMT_RGB24;
+    return 0;
+}
+
 static int camera_capture_read_internal(camera_capture_t *capture,
                                         camera_frame_t *frame, int reuse)
 {
@@ -763,18 +1032,31 @@ static int camera_capture_read_internal(camera_capture_t *capture,
         total_size = buffer.bytesused;
     }
 
-    if (reuse && frame->capacity >= total_size) {
-        copy = frame->data;
-    } else {
-        copy = reuse ? realloc(frame->data, total_size) : malloc(total_size);
-        if (copy == NULL) {
-            const int saved = errno;
-            (void)queue_buffer(capture, buffer.index, planes);
-            return set_errno(saved);
+    if (capture->rga_rgb24) {
+        const int conversion_result = convert_nv12_to_rgb24_rga(
+            capture, frame, &buffer, planes, reuse);
+        const int conversion_errno = errno;
+        if (queue_buffer(capture, buffer.index, planes) < 0) {
+            if (!reuse) {
+                camera_frame_release(frame);
+            }
+            return -1;
         }
-        frame->data = copy;
-        frame->capacity = total_size;
+        if (conversion_result < 0) {
+            if (!reuse) {
+                camera_frame_release(frame);
+            }
+            return set_errno(conversion_errno);
+        }
+        return 0;
     }
+
+    if (ensure_frame_capacity(frame, total_size, reuse) < 0) {
+        const int saved = errno;
+        (void)queue_buffer(capture, buffer.index, planes);
+        return set_errno(saved);
+    }
+    copy = frame->data;
 
     copy_offset = 0U;
     if (capture->buffer_type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {

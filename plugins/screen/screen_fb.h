@@ -73,6 +73,23 @@ int screen_fb_present_rotated(screen_fb_t *screen,
                               uint32_t background_rgb888,
                               unsigned int rotation_degrees);
 
+/*
+ * Present into a centered logical target box.  A zero target size selects the
+ * full logical canvas.  This is useful for placing a square camera frame in
+ * the center of a landscape panel without stretching it across 1920x1080.
+ */
+int screen_fb_present_rotated_to(screen_fb_t *screen,
+                                 const uint8_t *data,
+                                 size_t size,
+                                 const char *format,
+                                 unsigned int width,
+                                 unsigned int height,
+                                 unsigned int target_width,
+                                 unsigned int target_height,
+                                 int fit,
+                                 uint32_t background_rgb888,
+                                 unsigned int rotation_degrees);
+
 /* Draw a small 5x7 numeric string in logical coordinates. */
 int screen_fb_draw_number(screen_fb_t *screen,
                           double value,

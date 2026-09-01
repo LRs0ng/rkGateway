@@ -27,13 +27,20 @@ static void usage(const char *program)
             "用法: %s [选项]\n"
             "  -d, --device PATH       V4L2 设备，默认 /dev/video0\n"
             "  -o, --output PATH       输出文件；默认保存到程序目录 capture.<ext>\n"
-            "  -w, --width N           请求宽度，默认 1920\n"
-            "  -h, --height N          请求高度，默认 1080\n"
+            "  -w, --width N           请求 RKISP 输出宽度，默认 1920；pipeline 默认 640\n"
+            "  -h, --height N          请求 RKISP 输出高度，默认 1080；pipeline 默认 640\n"
             "  -f, --pixfmt FORMAT     auto/mjpeg/nv12/yuyv/yuv420/rgb24\n"
             "  -n, --count N           抓拍次数，0 表示持续抓拍，默认 1\n"
             "  -i, --interval-ms N     连续抓拍间隔，默认 1000 ms\n"
             "  -t, --timeout-ms N      单帧等待超时，默认 3000 ms\n"
             "  -u, --warmup N          丢弃初始帧数，默认 3\n"
+            "      --pipeline          启用 1944x1096 -> 中央1080x1080 -> 640x640\n"
+            "                          NV12 -> RGA RGB24 流水线\n"
+            "      --sensor-device P   IMX415 subdev，默认 auto\n"
+            "      --sensor-width N    sensor 模式宽度，默认 1944\n"
+            "      --sensor-height N   sensor 模式高度，默认 1096\n"
+            "      --crop-width N      RKISP 中央裁剪宽度，默认 1080\n"
+            "      --crop-height N     RKISP 中央裁剪高度，默认 1080\n"
             "      --control-device P  IMX415 控制节点，默认 auto\n"
             "      --brightness N      设置 V4L2 brightness（若节点支持）\n"
             "      --exposure N        设置 IMX415 exposure 行数\n"
@@ -200,6 +207,18 @@ int main(int argc, char **argv)
     const char *output_option = NULL;
     unsigned int width = 1920U;
     unsigned int height = 1080U;
+    int width_explicit = 0;
+    int height_explicit = 0;
+    int format_explicit = 0;
+    int pipeline_enabled = 0;
+    camera_pipeline_settings_t pipeline = {
+        .sensor_device = "auto",
+        .sensor_width = 1944U,
+        .sensor_height = 1096U,
+        .crop_width = 1080U,
+        .crop_height = 1080U,
+        .rga_rgb24 = 1,
+    };
     unsigned int count = 1U;
     unsigned int interval_ms = 1000U;
     unsigned int warmup = 3U;
@@ -222,6 +241,13 @@ int main(int argc, char **argv)
         {"interval-ms", required_argument, NULL, 'i'},
         {"timeout-ms", required_argument, NULL, 't'},
         {"warmup", required_argument, NULL, 'u'},
+        {"pipeline", no_argument, NULL, 6},
+        {"rga-pipeline", no_argument, NULL, 6},
+        {"sensor-device", required_argument, NULL, 7},
+        {"sensor-width", required_argument, NULL, 8},
+        {"sensor-height", required_argument, NULL, 9},
+        {"crop-width", required_argument, NULL, 10},
+        {"crop-height", required_argument, NULL, 11},
         {"control-device", required_argument, NULL, 2},
         {"brightness", required_argument, NULL, 3},
         {"exposure", required_argument, NULL, 4},
@@ -245,18 +271,21 @@ int main(int argc, char **argv)
                 fprintf(stderr, "无效宽度: %s\n", optarg);
                 return EXIT_FAILURE;
             }
+            width_explicit = 1;
             break;
         case 'h':
             if (parse_unsigned(optarg, &height) < 0 || height == 0U) {
                 fprintf(stderr, "无效高度: %s\n", optarg);
                 return EXIT_FAILURE;
             }
+            height_explicit = 1;
             break;
         case 'f':
             if (camera_pixel_format_parse(optarg, &requested_format) < 0) {
                 fprintf(stderr, "无效像素格式: %s\n", optarg);
                 return EXIT_FAILURE;
             }
+            format_explicit = 1;
             break;
         case 'n':
             if (parse_unsigned(optarg, &count) < 0) {
@@ -281,6 +310,45 @@ int main(int argc, char **argv)
                 fprintf(stderr, "无效预热帧数: %s\n", optarg);
                 return EXIT_FAILURE;
             }
+            break;
+        case 6:
+            pipeline_enabled = 1;
+            break;
+        case 7:
+            pipeline.sensor_device = optarg;
+            pipeline_enabled = 1;
+            break;
+        case 8:
+            if (parse_unsigned(optarg, &pipeline.sensor_width) < 0 ||
+                pipeline.sensor_width == 0U) {
+                fprintf(stderr, "无效 sensor 宽度: %s\n", optarg);
+                return EXIT_FAILURE;
+            }
+            pipeline_enabled = 1;
+            break;
+        case 9:
+            if (parse_unsigned(optarg, &pipeline.sensor_height) < 0 ||
+                pipeline.sensor_height == 0U) {
+                fprintf(stderr, "无效 sensor 高度: %s\n", optarg);
+                return EXIT_FAILURE;
+            }
+            pipeline_enabled = 1;
+            break;
+        case 10:
+            if (parse_unsigned(optarg, &pipeline.crop_width) < 0 ||
+                pipeline.crop_width == 0U) {
+                fprintf(stderr, "无效裁剪宽度: %s\n", optarg);
+                return EXIT_FAILURE;
+            }
+            pipeline_enabled = 1;
+            break;
+        case 11:
+            if (parse_unsigned(optarg, &pipeline.crop_height) < 0 ||
+                pipeline.crop_height == 0U) {
+                fprintf(stderr, "无效裁剪高度: %s\n", optarg);
+                return EXIT_FAILURE;
+            }
+            pipeline_enabled = 1;
             break;
         case 2:
             control_device = optarg;
@@ -314,6 +382,27 @@ int main(int argc, char **argv)
             return EXIT_FAILURE;
         }
     }
+    if (pipeline_enabled) {
+        if (!width_explicit) {
+            width = 640U;
+        }
+        if (!height_explicit) {
+            height = 640U;
+        }
+        if (!format_explicit) {
+            requested_format = CAMERA_PIXFMT_NV12;
+        }
+        if (pipeline.crop_width > pipeline.sensor_width ||
+            pipeline.crop_height > pipeline.sensor_height) {
+            fprintf(stderr, "裁剪尺寸不能超过 sensor 模式尺寸\n");
+            return EXIT_FAILURE;
+        }
+        if (requested_format != CAMERA_PIXFMT_AUTO &&
+            requested_format != CAMERA_PIXFMT_NV12) {
+            fprintf(stderr, "pipeline 模式的 RKISP 输入格式必须是 nv12 或 auto\n");
+            return EXIT_FAILURE;
+        }
+    }
     if (count != 1U && interval_ms == 0U) {
         fprintf(stderr, "连续抓拍时 interval-ms 不能为 0\n");
         return EXIT_FAILURE;
@@ -321,8 +410,10 @@ int main(int argc, char **argv)
 
     (void)signal(SIGINT, on_signal);
     (void)signal(SIGTERM, on_signal);
-    if (camera_capture_init(&capture, device, width, height, requested_format,
-                            warmup, timeout_ms, control_device, &controls) < 0) {
+    if (camera_capture_init_ex(
+            &capture, device, width, height, requested_format, warmup,
+            timeout_ms, control_device, &controls,
+            pipeline_enabled ? &pipeline : NULL) < 0) {
         fprintf(stderr, "打开摄像头失败: %s: %s\n", device, strerror(errno));
         return EXIT_FAILURE;
     }
@@ -351,6 +442,13 @@ int main(int argc, char **argv)
            capture.plane_count,
            camera_pixel_format_name(capture.pixfmt), capture.width,
            capture.height, output_base);
+    if (pipeline_enabled) {
+        printf("pipeline=sensor:%s/%ux%u crop:%u,%u/%ux%u "
+               "frame-output=RGB24(RGA)\n",
+               pipeline.sensor_device, pipeline.sensor_width,
+               pipeline.sensor_height, capture.crop_left, capture.crop_top,
+               capture.crop_width, capture.crop_height);
+    }
     while (!stop_requested && (count == 0U || sample < count)) {
         camera_frame_t frame;
         uint8_t *image = NULL;

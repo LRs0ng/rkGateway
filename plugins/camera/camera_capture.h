@@ -34,8 +34,24 @@ typedef struct camera_control_settings {
     int analogue_gain;
 } camera_control_settings_t;
 
+/*
+ * Optional Rockchip camera pipeline configuration.  When enabled, the sensor
+ * sub-device is switched before /dev/video* is opened, RKISP performs the
+ * centered crop and output scaling, and RGA converts every dequeued NV12 frame
+ * to tightly packed RGB24 before it is returned to the caller.
+ */
+typedef struct camera_pipeline_settings {
+    const char *sensor_device;       /* "auto" finds the IMX415 sub-device. */
+    unsigned int sensor_width;
+    unsigned int sensor_height;
+    unsigned int crop_width;
+    unsigned int crop_height;
+    int rga_rgb24;
+} camera_pipeline_settings_t;
+
 typedef struct camera_capture {
     int fd;
+    int sensor_fd;
     int control_fd;
     int cancel_fd;
     unsigned int width;
@@ -44,12 +60,17 @@ typedef struct camera_capture {
     unsigned int plane_count;
     unsigned int plane_bytesperline[VIDEO_MAX_PLANES];
     uint32_t pixfmt;
+    unsigned int crop_left;
+    unsigned int crop_top;
+    unsigned int crop_width;
+    unsigned int crop_height;
     enum v4l2_buf_type buffer_type;
     int timeout_ms;
     unsigned int warmup_frames;
     camera_mmap_buffer_t *buffers;
     unsigned int buffer_count;
     int streaming;
+    int rga_rgb24;
     camera_control_settings_t controls;
 } camera_capture_t;
 
@@ -80,6 +101,18 @@ int camera_capture_init(
     int timeout_ms,
     const char *control_device,
     const camera_control_settings_t *controls);
+
+int camera_capture_init_ex(
+    camera_capture_t *capture,
+    const char *device,
+    unsigned int width,
+    unsigned int height,
+    camera_pixel_format_t requested_format,
+    unsigned int warmup_frames,
+    int timeout_ms,
+    const char *control_device,
+    const camera_control_settings_t *controls,
+    const camera_pipeline_settings_t *pipeline);
 
 int camera_capture_read(camera_capture_t *capture, camera_frame_t *frame);
 /* frame must be zero-initialized or previously returned by this function. */

@@ -11,9 +11,15 @@
       "library": "./libgateway_camera.so",
       "driver_config": {
         "device": "/dev/video0",
-        "width": 1920,
-        "height": 1080,
-        "pixfmt": "auto",
+        "sensor_device": "auto",
+        "sensor_width": 1944,
+        "sensor_height": 1096,
+        "crop_width": 1080,
+        "crop_height": 1080,
+        "width": 640,
+        "height": 640,
+        "pixfmt": "nv12",
+        "rga_rgb24": true,
         "mode": "control",
         "warmup_frames": 3,
         "capture_timeout_ms": 3000,
@@ -45,7 +51,9 @@
       "library": "./libgateway_periodic_control_source.so",
       "config": {
         "request_id_prefix": "camera-capture",
-        "device_ids": ["camera-1"],
+        "device_ids": [
+          "camera-1"
+        ],
         "command": "capture",
         "interval_ms": 10000,
         "timeout_ms": 5000

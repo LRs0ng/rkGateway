@@ -117,6 +117,20 @@ int optional_timeout(
     return static_cast<int>(value);
 }
 
+bool optional_bool(
+    const plugin_json::Json& settings,
+    std::string_view key,
+    bool default_value) {
+    const auto* value = optional_member(settings, key);
+    if (value == nullptr) {
+        return default_value;
+    }
+    if (!value->is_boolean()) {
+        plugin_json::fail(kPluginName, key, "must be a boolean");
+    }
+    return value->get<bool>();
+}
+
 CameraDriver::Mode parse_mode(const plugin_json::Json& settings) {
     const auto mode = optional_string(settings, "mode", "periodic");
     if (mode == "periodic") {
@@ -171,9 +185,15 @@ std::unique_ptr<CameraDriver> make_camera(std::string_view settings_json) {
     }
     return std::make_unique<CameraDriver>(
         optional_string(settings, "device", "/dev/video0"),
-        optional_unsigned(settings, "width", 1920U, true),
-        optional_unsigned(settings, "height", 1080U, true),
+        optional_string(settings, "sensor_device", "auto"),
+        optional_unsigned(settings, "sensor_width", 1944U, true),
+        optional_unsigned(settings, "sensor_height", 1096U, true),
+        optional_unsigned(settings, "crop_width", 1080U, true),
+        optional_unsigned(settings, "crop_height", 1080U, true),
+        optional_unsigned(settings, "width", 640U, true),
+        optional_unsigned(settings, "height", 640U, true),
         parse_pixel_format(settings),
+        optional_bool(settings, "rga_rgb24", true),
         mode,
         std::chrono::milliseconds{interval_ms},
         optional_unsigned(settings, "warmup_frames", 3U),
@@ -192,9 +212,15 @@ std::unique_ptr<CameraDriver> make_camera(std::string_view settings_json) {
 
 CameraDriver::CameraDriver(
     std::string device_path,
+    std::string sensor_device,
+    unsigned int sensor_width,
+    unsigned int sensor_height,
+    unsigned int crop_width,
+    unsigned int crop_height,
     unsigned int width,
     unsigned int height,
     camera_pixel_format_t pixel_format,
+    bool rga_rgb24,
     Mode mode,
     std::chrono::milliseconds interval,
     unsigned int warmup_frames,
@@ -206,9 +232,15 @@ CameraDriver::CameraDriver(
     std::string control_device,
     camera_control_settings_t controls)
     : device_path_(std::move(device_path)),
+      sensor_device_(std::move(sensor_device)),
+      sensor_width_(sensor_width),
+      sensor_height_(sensor_height),
+      crop_width_(crop_width),
+      crop_height_(crop_height),
       width_(width),
       height_(height),
       pixel_format_(pixel_format),
+      rga_rgb24_(rga_rgb24),
       mode_(mode),
       interval_(interval),
       warmup_frames_(warmup_frames),
@@ -220,9 +252,16 @@ CameraDriver::CameraDriver(
       control_device_(std::move(control_device)),
       controls_(controls) {
     capture_.fd = -1;
+    capture_.sensor_fd = -1;
     capture_.control_fd = -1;
     capture_.cancel_fd = -1;
-    if (device_path_.empty() || width_ == 0U || height_ == 0U ||
+    if (device_path_.empty() || sensor_device_.empty() ||
+        sensor_width_ == 0U || sensor_height_ == 0U ||
+        crop_width_ == 0U || crop_height_ == 0U ||
+        crop_width_ > sensor_width_ || crop_height_ > sensor_height_ ||
+        width_ == 0U || height_ == 0U ||
+        (rga_rgb24_ && pixel_format_ != CAMERA_PIXFMT_AUTO &&
+         pixel_format_ != CAMERA_PIXFMT_NV12) ||
         interval_ <= std::chrono::milliseconds::zero() ||
         capture_timeout_ms_ <= 0 ||
         snapshot_wait_ <= std::chrono::milliseconds::zero() ||
@@ -277,13 +316,30 @@ void CameraDriver::start() {
         latest_received_at_ = {};
         latest_error_.clear();
     }
-    if (camera_capture_init(&capture_, device_path_.c_str(), width_, height_,
-                            pixel_format_, warmup_frames_, capture_timeout_ms_,
-                            control_device_.c_str(), &controls_) < 0) {
+    const camera_pipeline_settings_t pipeline{
+        .sensor_device = sensor_device_.c_str(),
+        .sensor_width = sensor_width_,
+        .sensor_height = sensor_height_,
+        .crop_width = crop_width_,
+        .crop_height = crop_height_,
+        .rga_rgb24 = rga_rgb24_ ? 1 : 0,
+    };
+    if (camera_capture_init_ex(
+            &capture_, device_path_.c_str(), width_, height_, pixel_format_,
+            warmup_frames_, capture_timeout_ms_, control_device_.c_str(),
+            &controls_, &pipeline) < 0) {
         throw std::runtime_error(
             "cannot start camera " + device_path_ + ": " +
             std::strerror(errno));
     }
+    std::cerr << "[camera] sensor=" << sensor_device_
+              << " mode=" << sensor_width_ << "x" << sensor_height_
+              << " crop=" << capture_.crop_left << "," << capture_.crop_top
+              << "/" << capture_.crop_width << "x" << capture_.crop_height
+              << " rkisp_output=" << capture_.width << "x" << capture_.height
+              << " " << camera_pixel_format_name(capture_.pixfmt)
+              << " frame_output=" << (rga_rgb24_ ? "RGB24(RGA)" : "native")
+              << '\n';
 
     started_.store(true, std::memory_order_release);
     try {
@@ -421,7 +477,8 @@ CameraDriver::CapturedImage CameraDriver::capture_snapshot(
         source_time_ns = latest_source_time_ns_;
     }
 
-    if (frame.pixfmt == V4L2_PIX_FMT_MJPEG) {
+    if (frame.pixfmt == V4L2_PIX_FMT_MJPEG ||
+        frame.pixfmt == V4L2_PIX_FMT_RGB24) {
         return CapturedImage{
             .bytes = std::move(raw_frame),
             .source_time_ns = source_time_ns,

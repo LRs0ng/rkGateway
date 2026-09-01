@@ -29,9 +29,15 @@ public:
 
     CameraDriver(
         std::string device_path,
+        std::string sensor_device,
+        unsigned int sensor_width,
+        unsigned int sensor_height,
+        unsigned int crop_width,
+        unsigned int crop_height,
         unsigned int width,
         unsigned int height,
         camera_pixel_format_t pixel_format,
+        bool rga_rgb24,
         Mode mode,
         std::chrono::milliseconds interval,
         unsigned int warmup_frames,
@@ -65,9 +71,15 @@ private:
     void publish_loop(std::stop_token stop_token) noexcept;
 
     std::string device_path_;
+    std::string sensor_device_;
+    unsigned int sensor_width_;
+    unsigned int sensor_height_;
+    unsigned int crop_width_;
+    unsigned int crop_height_;
     unsigned int width_;
     unsigned int height_;
     camera_pixel_format_t pixel_format_;
+    bool rga_rgb24_;
     Mode mode_;
     std::chrono::milliseconds interval_;
     unsigned int warmup_frames_;
