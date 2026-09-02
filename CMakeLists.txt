@@ -42,6 +42,10 @@ configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/configs/screen_linux.json"
     "${CMAKE_CURRENT_BINARY_DIR}/screen_config.json"
     COPYONLY)
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/configs/adc_mqtt_linux.json"
+    "${CMAKE_CURRENT_BINARY_DIR}/adc_mqtt_config.json"
+    COPYONLY)
 
 # miniGateway remains a third-party subproject. Its own targets are emitted
 # into build/miniGateway; the DS18B20 plugin below is emitted beside the
@@ -151,6 +155,25 @@ set_target_properties(gateway_screen PROPERTIES
 target_compile_options(gateway_screen PRIVATE
     -Wall -Wextra -Wpedantic -Wconversion)
 
+add_library(gateway_adc SHARED
+    plugins/adc/adc.cpp)
+target_include_directories(gateway_adc PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/plugins/adc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniGateway/include")
+target_link_libraries(gateway_adc
+    PUBLIC gateway_core
+    PRIVATE nlohmann_json::nlohmann_json)
+set_target_properties(gateway_adc PROPERTIES
+    OUTPUT_NAME "gateway_adc"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/miniGateway"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/miniGateway"
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/miniGateway"
+    BUILD_RPATH "$ORIGIN"
+    BUILD_RPATH_USE_ORIGIN ON
+    INSTALL_RPATH "$ORIGIN")
+target_compile_options(gateway_adc PRIVATE
+    -Wall -Wextra -Wpedantic -Wconversion)
+
 add_library(gateway_ds18b20 SHARED
     plugins/ds18b20/ds18b20.cpp)
 target_include_directories(gateway_ds18b20 PRIVATE
@@ -169,7 +192,7 @@ set_target_properties(gateway_ds18b20 PROPERTIES
 target_compile_options(gateway_ds18b20 PRIVATE
     -Wall -Wextra -Wpedantic -Wconversion)
 
-add_dependencies(miniGateway gateway_ds18b20 gateway_camera gateway_screen)
+add_dependencies(miniGateway gateway_ds18b20 gateway_camera gateway_screen gateway_adc)
 
 set(KERNEL_MODULE_BUILD_DIR
     "${CMAKE_CURRENT_BINARY_DIR}/kernel/ds18b20")
@@ -231,5 +254,5 @@ target_compile_options(ds18b20_test PRIVATE
     -Wall -Wextra -Wpedantic -Wconversion)
 
 add_custom_target(ds18b20_artifacts ALL
-    DEPENDS ds18b20_kernel_module gateway_ds18b20 gateway_camera
+    DEPENDS ds18b20_kernel_module gateway_ds18b20 gateway_camera gateway_adc
             miniGateway ds18b20_test camera_test screen_test gateway_screen)

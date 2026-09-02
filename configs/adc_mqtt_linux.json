@@ -1,0 +1,62 @@
+{
+  "runtime": {
+    "run_duration_ms": null,
+    "raw_queue_capacity": 16,
+    "control_queue_capacity": 8
+  },
+  "devices": [
+    {
+      "id": "adc-pico-1",
+      "driver": "adc_pico",
+      "library": "./libgateway_adc.so",
+      "driver_config": {
+        "device": "/dev/ttyACM0",
+        "point": "voltage",
+        "value_mode": "voltage",
+        "vref": 3.3,
+        "sample_rate_hz": 1000,
+        "batch_size": 500,
+        "read_timeout_ms": 100
+      },
+      "connection": {},
+      "points": [
+        {
+          "name": "voltage",
+          "type": "double",
+          "unit": "V",
+          "address": {},
+          "scale": 1.0,
+          "offset": 0.0,
+          "minimum": 0.0,
+          "maximum": 3.3
+        }
+      ]
+    }
+  ],
+  "groups": [],
+  "processors": [],
+  "event_publishers": [
+    {
+      "id": "mqtt",
+      "type": "mqtt",
+      "library": "./libgateway_mqtt_event_publisher.so",
+      "enabled": true,
+      "config": {
+        "host": "127.0.0.1",
+        "port": 1883,
+        "keepalive": 30,
+        "client_id": "rk-gateway-adc-pico",
+        "topic_prefix": "edge/events",
+        "qos": 0,
+        "retain": false,
+        "clean_session": true,
+        "username": "",
+        "password": "",
+        "reconnect_delay": 1,
+        "reconnect_delay_max": 30,
+        "reconnect_exponential_backoff": true
+      }
+    }
+  ],
+  "device_control_sources": []
+}
