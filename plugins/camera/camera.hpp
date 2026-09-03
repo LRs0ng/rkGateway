@@ -39,6 +39,7 @@ public:
         camera_pixel_format_t pixel_format,
         bool rga_rgb24,
         Mode mode,
+        bool initial_capture,
         std::chrono::milliseconds interval,
         unsigned int warmup_frames,
         int capture_timeout_ms,
@@ -65,7 +66,8 @@ private:
     };
 
     [[nodiscard]] CapturedImage capture_snapshot(
-        ControlClock::time_point deadline);
+        ControlClock::time_point deadline,
+        bool force_latest = false);
     [[nodiscard]] EnqueueResult emit_frame(CapturedImage&& image);
     void capture_loop(std::stop_token stop_token) noexcept;
     void publish_loop(std::stop_token stop_token) noexcept;
@@ -81,6 +83,7 @@ private:
     camera_pixel_format_t pixel_format_;
     bool rga_rgb24_;
     Mode mode_;
+    bool initial_capture_;
     std::chrono::milliseconds interval_;
     unsigned int warmup_frames_;
     int capture_timeout_ms_;

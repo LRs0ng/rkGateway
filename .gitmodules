@@ -1,3 +1,6 @@
 [submodule "third_party/miniGateway"]
 	path = third_party/miniGateway
 	url = https://github.com/LRs0ng/miniGateway.git
+[submodule "third_party/rknpu2"]
+	path = third_party/rknpu2
+	url = https://github.com/rockchip-linux/rknpu2.git

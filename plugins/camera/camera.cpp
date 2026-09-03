@@ -195,6 +195,7 @@ std::unique_ptr<CameraDriver> make_camera(std::string_view settings_json) {
         parse_pixel_format(settings),
         optional_bool(settings, "rga_rgb24", true),
         mode,
+        optional_bool(settings, "initial_capture", false),
         std::chrono::milliseconds{interval_ms},
         optional_unsigned(settings, "warmup_frames", 3U),
         timeout_ms,
@@ -222,6 +223,7 @@ CameraDriver::CameraDriver(
     camera_pixel_format_t pixel_format,
     bool rga_rgb24,
     Mode mode,
+    bool initial_capture,
     std::chrono::milliseconds interval,
     unsigned int warmup_frames,
     int capture_timeout_ms,
@@ -242,6 +244,7 @@ CameraDriver::CameraDriver(
       pixel_format_(pixel_format),
       rga_rgb24_(rga_rgb24),
       mode_(mode),
+      initial_capture_(initial_capture),
       interval_(interval),
       warmup_frames_(warmup_frames),
       capture_timeout_ms_(capture_timeout_ms),
@@ -387,6 +390,7 @@ void CameraDriver::stop() noexcept {
 
 void CameraDriver::capture_loop(std::stop_token stop_token) noexcept {
     camera_frame_t incoming{};
+    bool initial_frame_published = false;
     while (!stop_token.stop_requested()) {
         if (camera_capture_read_reuse(&capture_, &incoming) < 0) {
             const int saved = errno;
@@ -420,13 +424,41 @@ void CameraDriver::capture_loop(std::stop_token stop_token) noexcept {
             latest_error_.clear();
         }
         latest_ready_.notify_all();
+
+        // Controlled mode normally publishes only after a control request.
+        // Publish exactly one frame after the stream has produced a valid
+        // image so a processor (for example YOLO) has an event that can start
+        // the request/response capture loop.
+        if (mode_ == Mode::Control && initial_capture_ &&
+            !initial_frame_published) {
+            try {
+                auto image = capture_snapshot(
+                    ControlClock::time_point::max(), true);
+                const auto enqueue_result = emit_frame(std::move(image));
+                if (enqueue_result == EnqueueResult::Stopping) {
+                    break;
+                }
+                if (enqueue_result == EnqueueResult::Accepted) {
+                    initial_frame_published = true;
+                } else {
+                    std::cerr << "[camera] initial snapshot event queue is full; "
+                                 "will retry\n";
+                }
+            } catch (const std::exception& error) {
+                if (!stop_token.stop_requested()) {
+                    std::cerr << "[camera] initial snapshot failed: "
+                              << error.what() << '\n';
+                }
+            }
+        }
     }
     camera_frame_release(&incoming);
     latest_ready_.notify_all();
 }
 
 CameraDriver::CapturedImage CameraDriver::capture_snapshot(
-    ControlClock::time_point deadline) {
+    ControlClock::time_point deadline,
+    bool force_latest) {
     const auto local_deadline = ControlClock::now() + snapshot_wait_;
     if (deadline > local_deadline) {
         deadline = local_deadline;
@@ -439,12 +471,12 @@ CameraDriver::CapturedImage CameraDriver::capture_snapshot(
     {
         std::unique_lock lock(latest_mutex_);
         const std::uint64_t baseline = latest_sequence_;
-        const auto ready = [this, baseline] {
+        const auto ready = [this, baseline, force_latest] {
             if (!started_.load(std::memory_order_acquire) ||
                 latest_frame_.data == nullptr || latest_frame_.size == 0U) {
                 return !started_.load(std::memory_order_acquire);
             }
-            if (snapshot_policy_ == SnapshotPolicy::Next &&
+            if (!force_latest && snapshot_policy_ == SnapshotPolicy::Next &&
                 latest_sequence_ <= baseline) {
                 return false;
             }

@@ -1,0 +1,104 @@
+{
+  "runtime": {
+    "run_duration_ms": null,
+    "raw_queue_capacity": 8,
+    "control_queue_capacity": 8
+  },
+  "devices": [
+    {
+      "id": "camera-1",
+      "driver": "camera",
+      "library": "./libgateway_camera.so",
+      "driver_config": {
+        "device": "/dev/video0",
+        "sensor_device": "auto",
+        "sensor_width": 1944,
+        "sensor_height": 1096,
+        "crop_width": 1080,
+        "crop_height": 1080,
+        "width": 640,
+        "height": 640,
+        "pixfmt": "nv12",
+        "rga_rgb24": true,
+        "mode": "control",
+        "initial_capture": true,
+        "warmup_frames": 3,
+        "capture_timeout_ms": 3000,
+        "snapshot_policy": "next",
+        "snapshot_wait_ms": 1000,
+        "max_frame_age_ms": 500,
+        "control_command": "capture"
+      },
+      "connection": {},
+      "points": [
+        {
+          "name": "image",
+          "type": "bytes",
+          "unit": "",
+          "address": {},
+          "scale": 1.0,
+          "offset": 0.0
+        }
+      ]
+    }
+  ],
+  "groups": [],
+  "processors": [
+    {
+      "id": "yolo",
+      "type": "yolov5_rknn",
+      "library": "./libgateway_yolo.so",
+      "enabled": true,
+      "config": {
+        "model": "./model/yolov5s_rk3566.rknn",
+        "input_point": "image",
+        "output_point": "image",
+        "camera_device_id": "camera-1",
+        "camera_command": "capture",
+        "control_request_prefix": "yolo-capture",
+        "input_width": 640,
+        "input_height": 640,
+        "confidence_threshold": 0.25,
+        "nms_threshold": 0.45,
+        "max_detections": 64,
+        "control_timeout_ms": 5000,
+        "draw_confidence": true,
+        "box_color": "0x00ff00",
+        "text_color": "0xffffff"
+      }
+    }
+  ],
+  "event_publishers": [
+    {
+      "id": "screen",
+      "type": "screen",
+      "library": "./libgateway_screen.so",
+      "enabled": true,
+      "config": {
+        "device": "/dev/fb0",
+        "panel_controller": "hx8399-c",
+        "touch_controller": "gt911",
+        "pixel_format": "rgb888",
+        "expected_width": 1080,
+        "expected_height": 1920,
+        "image_point": "image",
+        "image_format": "rgb24",
+        "image_width": 640,
+        "image_height": 640,
+        "fit_image": true,
+        "image_target_width": 1080,
+        "image_target_height": 1080,
+        "output_mode": "landscape",
+        "rotation_degrees": 90,
+        "numeric_scale": 1,
+        "numeric_x": 0,
+        "numeric_y": 0,
+        "numeric_foreground": "0xffffff",
+        "numeric_background": "0x000000",
+        "clear_before_numeric": true,
+        "wait_for_vsync": true
+      }
+    }
+  ],
+  "device_control_sources": []
+}

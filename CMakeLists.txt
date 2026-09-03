@@ -46,6 +46,10 @@ configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/configs/adc_mqtt_linux.json"
     "${CMAKE_CURRENT_BINARY_DIR}/adc_mqtt_config.json"
     COPYONLY)
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/configs/yolo_linux.json"
+    "${CMAKE_CURRENT_BINARY_DIR}/yolo_config.json"
+    COPYONLY)
 
 # miniGateway remains a third-party subproject. Its own targets are emitted
 # into build/miniGateway; the DS18B20 plugin below is emitted beside the
@@ -102,6 +106,31 @@ endif()
 file(COPY ${RGA_RUNTIME_LIBRARIES}
     DESTINATION "${CMAKE_CURRENT_BINARY_DIR}/miniGateway"
     FOLLOW_SYMLINK_CHAIN)
+
+# RKNN runtime/API for the RK3566 NPU. The default points at the
+# repository-local Rockchip runtime, but callers may override RKNN_ROOT when
+# using a different SDK revision.
+set(RKNN_ROOT
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rknpu2/runtime/RK356X/Linux/librknn_api"
+    CACHE PATH "RKNN API root for RK356X Linux")
+find_path(RKNN_INCLUDE_DIR rknn_api.h
+    PATHS "${RKNN_ROOT}/include" NO_DEFAULT_PATH REQUIRED)
+find_library(RKNN_LIBRARY NAMES rknnrt
+    PATHS "${RKNN_ROOT}/aarch64" NO_DEFAULT_PATH REQUIRED)
+add_library(RKNN::RT SHARED IMPORTED GLOBAL)
+set_target_properties(RKNN::RT PROPERTIES
+    IMPORTED_LOCATION "${RKNN_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${RKNN_INCLUDE_DIR}")
+configure_file(
+    "${RKNN_LIBRARY}"
+    "${CMAKE_CURRENT_BINARY_DIR}/miniGateway/librknnrt.so"
+    COPYONLY)
+
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/miniGateway/model")
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/plugins/yolo/model/yolov5s_rk3566.rknn"
+    "${CMAKE_CURRENT_BINARY_DIR}/miniGateway/model/yolov5s_rk3566.rknn"
+    COPYONLY)
 
 add_library(camera_capture_support STATIC
     plugins/camera/camera_capture.c)
@@ -192,7 +221,29 @@ set_target_properties(gateway_ds18b20 PROPERTIES
 target_compile_options(gateway_ds18b20 PRIVATE
     -Wall -Wextra -Wpedantic -Wconversion)
 
-add_dependencies(miniGateway gateway_ds18b20 gateway_camera gateway_screen gateway_adc)
+add_library(gateway_yolo SHARED
+    plugins/yolo/yolo.cpp)
+target_include_directories(gateway_yolo PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/plugins/yolo"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniGateway/include"
+    "${RKNN_INCLUDE_DIR}")
+target_link_libraries(gateway_yolo
+    PUBLIC gateway_core
+    PRIVATE nlohmann_json::nlohmann_json RKNN::RT m)
+set_target_properties(gateway_yolo PROPERTIES
+    OUTPUT_NAME "gateway_yolo"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/miniGateway"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/miniGateway"
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/miniGateway"
+    BUILD_RPATH "$ORIGIN"
+    BUILD_RPATH_USE_ORIGIN ON
+    BUILD_WITH_INSTALL_RPATH TRUE
+    INSTALL_RPATH "$ORIGIN")
+target_compile_options(gateway_yolo PRIVATE
+    -Wall -Wextra -Wpedantic -Wconversion)
+
+add_dependencies(miniGateway
+    gateway_ds18b20 gateway_camera gateway_screen gateway_adc gateway_yolo)
 
 set(KERNEL_MODULE_BUILD_DIR
     "${CMAKE_CURRENT_BINARY_DIR}/kernel/ds18b20")
@@ -255,4 +306,5 @@ target_compile_options(ds18b20_test PRIVATE
 
 add_custom_target(ds18b20_artifacts ALL
     DEPENDS ds18b20_kernel_module gateway_ds18b20 gateway_camera gateway_adc
-            miniGateway ds18b20_test camera_test screen_test gateway_screen)
+            gateway_yolo miniGateway ds18b20_test camera_test screen_test
+            gateway_screen)
