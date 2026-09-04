@@ -47,11 +47,16 @@
   "processors": [
     {
       "id": "yolo",
-      "type": "yolov5_rknn",
+      "type": "yolov5",
       "library": "./libgateway_yolo.so",
       "enabled": true,
       "config": {
-        "model": "./model/yolov5s_rk3566.rknn",
+        "inference_backend": "onnxruntime",
+        "rknn_model": "./model/yolov5s_rk3566.rknn",
+        "onnx_model": "./model/yolov5n.onnx",
+        "onnx_intra_op_threads": 4,
+        "onnx_inter_op_threads": 1,
+        "onnx_input_scale": 0.00392156862745098,
         "input_point": "image",
         "output_point": "image",
         "camera_device_id": "camera-1",

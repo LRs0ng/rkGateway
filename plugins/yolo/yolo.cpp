@@ -2,12 +2,14 @@
 
 #include "gateway/plugin_api.hpp"
 #include "plugin_support/plugin_json.hpp"
+#include "onnxruntime_cxx_api.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cctype>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -23,7 +25,7 @@
 namespace gateway {
 namespace {
 
-constexpr std::string_view kPluginName{"yolov5 npu processor"};
+constexpr std::string_view kPluginName{"yolov5 processor"};
 constexpr unsigned int kClassCount = 80U;
 constexpr unsigned int kAttributesPerAnchor = 5U + kClassCount;
 constexpr unsigned int kAnchorCount = 3U;
@@ -338,18 +340,60 @@ void draw_text(ByteArray& image, unsigned int width, unsigned int height,
     }
 }
 
+YoloProcessor::InferenceBackend parse_backend(
+    const plugin_json::Json& settings) {
+    auto backend = optional_string(settings, "inference_backend", "rknn");
+    std::transform(backend.begin(), backend.end(), backend.begin(),
+                   [](unsigned char value) {
+                       return static_cast<char>(std::tolower(value));
+                   });
+    if (backend == "rknn" || backend == "npu") {
+        return YoloProcessor::InferenceBackend::Rknn;
+    }
+    if (backend == "onnxruntime" || backend == "onnx" || backend == "cpu") {
+        return YoloProcessor::InferenceBackend::OnnxRuntime;
+    }
+    plugin_json::fail(
+        kPluginName, "inference_backend",
+        "must be one of: rknn, npu, onnxruntime, onnx, cpu");
+}
+
+std::string select_model_path(
+    const plugin_json::Json& settings,
+    YoloProcessor::InferenceBackend backend) {
+    // "model" remains an explicit override.  With rknn_model and onnx_model
+    // both configured, switching inference_backend is enough to switch the
+    // engine and its corresponding model.
+    if (optional_member(settings, "model") != nullptr) {
+        return optional_string(settings, "model", "");
+    }
+    if (backend == YoloProcessor::InferenceBackend::Rknn) {
+        return optional_string(
+            settings, "rknn_model", "./model/yolov5s_rk3566.rknn");
+    }
+    return optional_string(
+        settings, "onnx_model", "./model/yolov5n.onnx");
+}
+
 std::unique_ptr<YoloProcessor> make_yolo(std::string_view settings_json) {
     const auto settings = plugin_json::parse_object(settings_json, kPluginName);
+    const auto backend = parse_backend(settings);
     const auto width = optional_unsigned(settings, "input_width", 640U, true);
     const auto height = optional_unsigned(settings, "input_height", 640U, true);
     const auto confidence = optional_float(settings, "confidence_threshold", 0.25F);
     const auto nms = optional_float(settings, "nms_threshold", 0.45F);
+    const auto onnx_input_scale =
+        optional_float(settings, "onnx_input_scale", 1.0F / 255.0F);
     if (!(confidence > 0.0F && confidence < 1.0F)) {
         plugin_json::fail(kPluginName, "confidence_threshold",
                           "must be between 0 and 1");
     }
     if (!(nms >= 0.0F && nms <= 1.0F)) {
         plugin_json::fail(kPluginName, "nms_threshold", "must be between 0 and 1");
+    }
+    if (!(onnx_input_scale > 0.0F) || !std::isfinite(onnx_input_scale)) {
+        plugin_json::fail(kPluginName, "onnx_input_scale",
+                          "must be a finite positive number");
     }
     const auto box_thickness =
         optional_unsigned(settings, "box_thickness", 4U, true);
@@ -362,7 +406,7 @@ std::unique_ptr<YoloProcessor> make_yolo(std::string_view settings_json) {
         plugin_json::fail(kPluginName, "label_scale", "must be between 1 and 8");
     }
     return std::make_unique<YoloProcessor>(
-        optional_string(settings, "model", "./model/yolov5s_rk3566.rknn"),
+        backend, select_model_path(settings, backend),
         optional_string(settings, "input_point", "image"),
         optional_string(settings, "output_point", "image"),
         optional_string(settings, "camera_device_id", "camera-1"),
@@ -371,6 +415,9 @@ std::unique_ptr<YoloProcessor> make_yolo(std::string_view settings_json) {
         width, height, confidence, nms,
         optional_unsigned(settings, "max_detections", 64U, true),
         optional_unsigned(settings, "control_timeout_ms", 5000U, true),
+        optional_unsigned(settings, "onnx_intra_op_threads", 1U, true),
+        optional_unsigned(settings, "onnx_inter_op_threads", 1U, true),
+        onnx_input_scale,
         optional_bool(settings, "draw_confidence", true), box_thickness,
         label_scale, parse_color(settings, "box_color", 0x00ff00U),
         parse_color(settings, "text_color", 0xffffffU));
@@ -378,7 +425,40 @@ std::unique_ptr<YoloProcessor> make_yolo(std::string_view settings_json) {
 
 }  // namespace
 
+struct YoloProcessor::OnnxState {
+    enum class InputType {
+        Float32,
+        Float16,
+        UInt8,
+    };
+
+    OnnxState(unsigned int intra_op_threads, unsigned int inter_op_threads)
+        : environment(ORT_LOGGING_LEVEL_WARNING, "miniGateway-yolo"),
+          session(nullptr) {
+        session_options.SetIntraOpNumThreads(
+            static_cast<int>(intra_op_threads));
+        session_options.SetInterOpNumThreads(
+            static_cast<int>(inter_op_threads));
+        session_options.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+        session_options.SetGraphOptimizationLevel(
+            GraphOptimizationLevel::ORT_ENABLE_ALL);
+    }
+
+    Ort::Env environment;
+    Ort::SessionOptions session_options;
+    Ort::Session session;
+    std::string input_name;
+    std::vector<std::string> output_names;
+    std::vector<float> float_input;
+    std::vector<Ort::Float16_t> float16_input;
+    std::vector<std::uint8_t> uint8_input;
+    std::vector<float> float_output;
+    bool input_nchw{true};
+    InputType input_type{InputType::Float32};
+};
+
 YoloProcessor::YoloProcessor(
+    InferenceBackend backend,
     std::string model_path,
     std::string input_point,
     std::string output_point,
@@ -391,12 +471,19 @@ YoloProcessor::YoloProcessor(
     float nms_threshold,
     unsigned int max_detections,
     unsigned int control_timeout_ms,
+    unsigned int onnx_intra_op_threads,
+    unsigned int onnx_inter_op_threads,
+    float onnx_input_scale,
     bool draw_confidence,
     unsigned int box_thickness,
     unsigned int label_scale,
     std::uint32_t box_color,
     std::uint32_t text_color)
-    : model_path_(std::move(model_path)),
+    : backend_(backend),
+      model_path_(std::move(model_path)),
+      model_version_(backend == InferenceBackend::Rknn
+                         ? "yolov5-rknn-npu"
+                         : "yolov5-onnxruntime-cpu"),
       input_point_(std::move(input_point)),
       output_point_(std::move(output_point)),
       camera_device_id_(std::move(camera_device_id)),
@@ -408,6 +495,9 @@ YoloProcessor::YoloProcessor(
       nms_threshold_(nms_threshold),
       max_detections_(max_detections),
       control_timeout_ms_(control_timeout_ms),
+      onnx_intra_op_threads_(onnx_intra_op_threads),
+      onnx_inter_op_threads_(onnx_inter_op_threads),
+      onnx_input_scale_(onnx_input_scale),
       draw_confidence_(draw_confidence),
       box_thickness_(box_thickness),
       label_scale_(label_scale),
@@ -417,29 +507,40 @@ YoloProcessor::YoloProcessor(
         camera_device_id_.empty() || camera_command_.empty() ||
         control_request_prefix_.empty() || input_width_ == 0U ||
         input_height_ == 0U || max_detections_ == 0U ||
-        control_timeout_ms_ == 0U || box_thickness_ == 0U ||
-        label_scale_ == 0U) {
+        control_timeout_ms_ == 0U || onnx_intra_op_threads_ == 0U ||
+        onnx_inter_op_threads_ == 0U || !(onnx_input_scale_ > 0.0F) ||
+        box_thickness_ == 0U || label_scale_ == 0U) {
         throw std::invalid_argument("invalid YOLO processor settings");
     }
     initialize_model();
 }
 
 YoloProcessor::~YoloProcessor() {
-    if (initialized_) {
+    onnx_state_.reset();
+    if (context_ != 0) {
         (void)rknn_destroy(context_);
         context_ = 0;
-        initialized_ = false;
     }
+    initialized_ = false;
 }
 
 void YoloProcessor::initialize_model() {
+    if (backend_ == InferenceBackend::Rknn) {
+        initialize_rknn_model();
+    } else {
+        initialize_onnx_model();
+    }
+    initialized_ = true;
+}
+
+void YoloProcessor::initialize_rknn_model() {
     std::ifstream model_file(model_path_, std::ios::binary | std::ios::ate);
     if (!model_file) {
-        throw std::runtime_error("cannot open YOLO model: " + model_path_);
+        throw std::runtime_error("cannot open YOLO RKNN model: " + model_path_);
     }
     const auto model_size = model_file.tellg();
     if (model_size <= 0) {
-        throw std::runtime_error("YOLO model is empty: " + model_path_);
+        throw std::runtime_error("YOLO RKNN model is empty: " + model_path_);
     }
     model_data_.resize(static_cast<std::size_t>(model_size));
     model_file.seekg(0, std::ios::beg);
@@ -447,7 +548,7 @@ void YoloProcessor::initialize_model() {
         reinterpret_cast<char*>(model_data_.data()),
         static_cast<std::streamsize>(model_size));
     if (!model_file) {
-        throw std::runtime_error("cannot read YOLO model: " + model_path_);
+        throw std::runtime_error("cannot read YOLO RKNN model: " + model_path_);
     }
 
     const int result = rknn_init(
@@ -464,7 +565,7 @@ void YoloProcessor::initialize_model() {
         (void)rknn_destroy(context_);
         context_ = 0;
         throw std::runtime_error(
-            "YOLO model must have one input and at least one output");
+            "YOLO RKNN model must have one input and at least one output");
     }
 
     input_attr_.index = 0U;
@@ -472,7 +573,7 @@ void YoloProcessor::initialize_model() {
                   sizeof(input_attr_)) < 0) {
         (void)rknn_destroy(context_);
         context_ = 0;
-        throw std::runtime_error("cannot query YOLO input tensor");
+        throw std::runtime_error("cannot query YOLO RKNN input tensor");
     }
     const auto input_elements = tensor_elements(input_attr_);
     const auto expected_elements = static_cast<std::uint64_t>(input_width_) *
@@ -481,7 +582,7 @@ void YoloProcessor::initialize_model() {
         (void)rknn_destroy(context_);
         context_ = 0;
         throw std::runtime_error(
-            "YOLO input shape " + tensor_shape(input_attr_) +
+            "YOLO RKNN input shape " + tensor_shape(input_attr_) +
             " is incompatible with configured RGB image " +
             std::to_string(input_width_) + "x" +
             std::to_string(input_height_));
@@ -496,21 +597,18 @@ void YoloProcessor::initialize_model() {
                       sizeof(output.attr)) < 0) {
             (void)rknn_destroy(context_);
             context_ = 0;
-            throw std::runtime_error("cannot query YOLO output tensor");
+            throw std::runtime_error("cannot query YOLO RKNN output tensor");
         }
 
-        // The supplied yolov5s_rk3566.rknn is exported with a single decoded
-        // output [1, 25200, 85].  Also accept the three raw detection heads
-        // emitted by the Rockchip sample model.
         if (output.attr.n_dims >= 3U) {
             const auto second_last = output.attr.n_dims - 2U;
             const auto last = output.attr.n_dims - 1U;
             const auto dim_a = output.attr.dims[second_last];
             const auto dim_b = output.attr.dims[last];
-            if ((dim_a == 25200U && dim_b >= kAttributesPerAnchor) ||
-                (dim_b == 25200U && dim_a >= kAttributesPerAnchor)) {
+            if ((dim_a > 0U && dim_b >= kAttributesPerAnchor && dim_b <= 512U) ||
+                (dim_b > 0U && dim_a >= kAttributesPerAnchor && dim_a <= 512U)) {
                 output.kind = OutputKind::FlatDecoded;
-                output.flat_attributes_first = dim_b == 25200U;
+                output.flat_attributes_first = dim_a <= 512U && dim_b > 512U;
                 output.flat_rows = output.flat_attributes_first ? dim_b : dim_a;
                 output.flat_attributes = output.flat_attributes_first ? dim_a : dim_b;
                 outputs_.push_back(output);
@@ -567,7 +665,7 @@ void YoloProcessor::initialize_model() {
         (void)rknn_destroy(context_);
         context_ = 0;
         throw std::runtime_error(
-            "YOLO model outputs are neither one [1,25200,85] decoded output "
+            "YOLO RKNN outputs are neither one decoded [1,N,85] tensor "
             "nor three 255-channel detection heads");
     }
     if (!has_flat_output) {
@@ -578,8 +676,7 @@ void YoloProcessor::initialize_model() {
                   });
     }
 
-    initialized_ = true;
-    std::cerr << "[yolo] model=" << model_path_
+    std::cerr << "[yolo] backend=rknn model=" << model_path_
               << " input=" << tensor_shape(input_attr_)
               << " output_count=" << outputs_.size();
     for (const auto& output : outputs_) {
@@ -587,6 +684,102 @@ void YoloProcessor::initialize_model() {
                   << (output.kind == OutputKind::FlatDecoded ? "decoded" : "head");
     }
     std::cerr << '\n';
+}
+
+void YoloProcessor::initialize_onnx_model() {
+    onnx_state_ = std::make_unique<OnnxState>(
+        onnx_intra_op_threads_, onnx_inter_op_threads_);
+    try {
+        onnx_state_->session = Ort::Session(
+            onnx_state_->environment, model_path_.c_str(),
+            onnx_state_->session_options);
+
+        const std::size_t input_count = onnx_state_->session.GetInputCount();
+        const std::size_t output_count = onnx_state_->session.GetOutputCount();
+        if (input_count != 1U || output_count == 0U) {
+            throw std::runtime_error(
+                "YOLO ONNX model must have one input and at least one output");
+        }
+
+        Ort::AllocatorWithDefaultOptions allocator;
+        auto input_name =
+            onnx_state_->session.GetInputNameAllocated(0U, allocator);
+        onnx_state_->input_name = input_name.get();
+
+        // Keep the owning Ort::TypeInfo alive while reading the unowned
+        // TensorTypeAndShapeInfo view returned by GetTensorTypeAndShapeInfo().
+        // Chaining these calls through the temporary returned by
+        // GetInputTypeInfo() leaves a dangling view on some AArch64 builds
+        // of ONNX Runtime and can make a valid [1,3,640,640] model appear
+        // to have an invalid rank/batch shape.
+        const auto input_type_info = onnx_state_->session.GetInputTypeInfo(0U);
+        const auto input_info = input_type_info.GetTensorTypeAndShapeInfo();
+        const auto input_shape = input_info.GetShape();
+        if (input_shape.size() != 4U ||
+            (input_shape[0] > 0 && input_shape[0] != 1)) {
+            throw std::runtime_error(
+                "YOLO ONNX input must be a rank-4 tensor with batch size 1");
+        }
+        if (input_shape[1] == 3 ||
+            (input_shape[1] < 0 && input_shape[3] != 3)) {
+            onnx_state_->input_nchw = true;
+            if ((input_shape[2] > 0 &&
+                 input_shape[2] != static_cast<std::int64_t>(input_height_)) ||
+                (input_shape[3] > 0 &&
+                 input_shape[3] != static_cast<std::int64_t>(input_width_))) {
+                throw std::runtime_error(
+                    "YOLO ONNX NCHW input size does not match input_width/input_height");
+            }
+        } else if (input_shape[3] == 3 || input_shape[3] < 0) {
+            onnx_state_->input_nchw = false;
+            if ((input_shape[1] > 0 &&
+                 input_shape[1] != static_cast<std::int64_t>(input_height_)) ||
+                (input_shape[2] > 0 &&
+                 input_shape[2] != static_cast<std::int64_t>(input_width_))) {
+                throw std::runtime_error(
+                    "YOLO ONNX NHWC input size does not match input_width/input_height");
+            }
+        } else {
+            throw std::runtime_error(
+                "YOLO ONNX input must have three RGB channels in NCHW or NHWC layout");
+        }
+
+        const auto input_type = input_info.GetElementType();
+        if (input_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+            onnx_state_->input_type = OnnxState::InputType::Float32;
+        } else if (input_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+            onnx_state_->input_type = OnnxState::InputType::Float16;
+        } else if (input_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8) {
+            onnx_state_->input_type = OnnxState::InputType::UInt8;
+        } else {
+            throw std::runtime_error(
+                "YOLO ONNX input type must be float32, float16, or uint8");
+        }
+
+        onnx_state_->output_names.reserve(output_count);
+        for (std::size_t index = 0U; index < output_count; ++index) {
+            auto output_name =
+                onnx_state_->session.GetOutputNameAllocated(index, allocator);
+            onnx_state_->output_names.emplace_back(output_name.get());
+        }
+
+        const char* input_type_name = "uint8";
+        if (onnx_state_->input_type == OnnxState::InputType::Float32) {
+            input_type_name = "float32";
+        } else if (onnx_state_->input_type == OnnxState::InputType::Float16) {
+            input_type_name = "float16";
+        }
+        std::cerr << "[yolo] backend=onnxruntime model=" << model_path_
+                  << " input=" << (onnx_state_->input_nchw ? "NCHW" : "NHWC")
+                  << " type=" << input_type_name
+                  << " size=" << input_width_ << "x" << input_height_
+                  << " outputs=" << output_count
+                  << " intra_threads=" << onnx_intra_op_threads_
+                  << " inter_threads=" << onnx_inter_op_threads_ << '\n';
+    } catch (...) {
+        onnx_state_.reset();
+        throw;
+    }
 }
 
 float YoloProcessor::output_value(
@@ -616,7 +809,260 @@ float YoloProcessor::flat_output_value(
     return data[static_cast<std::size_t>(row) * output.flat_attributes + attribute];
 }
 
+std::vector<YoloProcessor::Detection> YoloProcessor::decode_flat_output(
+    const float* data,
+    std::size_t rows,
+    std::size_t attributes,
+    bool attributes_first) const {
+    if (data == nullptr || rows == 0U || attributes < kAttributesPerAnchor) {
+        throw std::runtime_error("YOLO decoded output has an invalid shape");
+    }
+
+    const auto value_at = [=](std::size_t row, std::size_t attribute) {
+        return attributes_first ? data[attribute * rows + row]
+                                : data[row * attributes + attribute];
+    };
+    const auto to_probability = [](float value) {
+        return value >= 0.0F && value <= 1.0F ? value : sigmoid(value);
+    };
+
+    std::vector<Detection> candidates;
+    candidates.reserve(std::min<std::size_t>(rows, 1024U));
+    for (std::size_t row = 0U; row < rows; ++row) {
+        const float object_probability = to_probability(value_at(row, 4U));
+        if (!std::isfinite(object_probability) ||
+            object_probability < confidence_threshold_) {
+            continue;
+        }
+
+        int class_id = 0;
+        float best_class = 0.0F;
+        for (std::size_t cls = 0U; cls < kClassCount; ++cls) {
+            const float probability = to_probability(value_at(row, 5U + cls));
+            if (std::isfinite(probability) && probability > best_class) {
+                best_class = probability;
+                class_id = static_cast<int>(cls);
+            }
+        }
+        const float confidence = object_probability * best_class;
+        if (!std::isfinite(confidence) || confidence < confidence_threshold_) {
+            continue;
+        }
+
+        const float center_x = value_at(row, 0U);
+        const float center_y = value_at(row, 1U);
+        const float box_width = value_at(row, 2U);
+        const float box_height = value_at(row, 3U);
+        if (!std::isfinite(center_x) || !std::isfinite(center_y) ||
+            !std::isfinite(box_width) || !std::isfinite(box_height) ||
+            box_width <= 0.0F || box_height <= 0.0F) {
+            continue;
+        }
+
+        Detection detection{
+            .left = static_cast<int>(std::floor(center_x - box_width / 2.0F)),
+            .top = static_cast<int>(std::floor(center_y - box_height / 2.0F)),
+            .right = static_cast<int>(std::ceil(center_x + box_width / 2.0F)),
+            .bottom = static_cast<int>(std::ceil(center_y + box_height / 2.0F)),
+            .class_id = class_id,
+            .confidence = confidence,
+        };
+        detection.left = std::clamp(
+            detection.left, 0, static_cast<int>(input_width_) - 1);
+        detection.top = std::clamp(
+            detection.top, 0, static_cast<int>(input_height_) - 1);
+        detection.right = std::clamp(
+            detection.right, 0, static_cast<int>(input_width_) - 1);
+        detection.bottom = std::clamp(
+            detection.bottom, 0, static_cast<int>(input_height_) - 1);
+        if (detection.right > detection.left &&
+            detection.bottom > detection.top) {
+            candidates.push_back(detection);
+        }
+    }
+    return candidates;
+}
+
+std::vector<YoloProcessor::Detection> YoloProcessor::apply_nms(
+    std::vector<Detection> candidates) const {
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Detection& left, const Detection& right) {
+                  return left.confidence > right.confidence;
+              });
+    std::vector<bool> suppressed(candidates.size(), false);
+    std::vector<Detection> result;
+    result.reserve(std::min<std::size_t>(max_detections_, candidates.size()));
+    for (std::size_t index = 0U; index < candidates.size(); ++index) {
+        if (suppressed[index]) {
+            continue;
+        }
+        result.push_back(candidates[index]);
+        if (result.size() >= max_detections_) {
+            break;
+        }
+        for (std::size_t other = index + 1U; other < candidates.size(); ++other) {
+            if (!suppressed[other] &&
+                candidates[other].class_id == candidates[index].class_id &&
+                overlap(candidates[index], candidates[other]) > nms_threshold_) {
+                suppressed[other] = true;
+            }
+        }
+    }
+    return result;
+}
+
 std::vector<YoloProcessor::Detection> YoloProcessor::infer(
+    const ByteArray& image) {
+    if (backend_ == InferenceBackend::Rknn) {
+        return infer_rknn(image);
+    }
+    return infer_onnx(image);
+}
+
+std::vector<YoloProcessor::Detection> YoloProcessor::infer_onnx(
+    const ByteArray& image) {
+    const auto expected_size = static_cast<std::size_t>(input_width_) *
+                               input_height_ * 3U;
+    if (image.size() != expected_size) {
+        throw std::runtime_error(
+            "YOLO expects RGB24 " + std::to_string(input_width_) + "x" +
+            std::to_string(input_height_) + " (" +
+            std::to_string(expected_size) + " bytes), got " +
+            std::to_string(image.size()));
+    }
+    if (onnx_state_ == nullptr) {
+        throw std::runtime_error("YOLO ONNX Runtime session is not initialized");
+    }
+
+    const std::size_t pixel_count =
+        static_cast<std::size_t>(input_width_) * input_height_;
+    const std::array<std::int64_t, 4> input_shape = onnx_state_->input_nchw
+        ? std::array<std::int64_t, 4>{
+              1, 3, static_cast<std::int64_t>(input_height_),
+              static_cast<std::int64_t>(input_width_)}
+        : std::array<std::int64_t, 4>{
+              1, static_cast<std::int64_t>(input_height_),
+              static_cast<std::int64_t>(input_width_), 3};
+
+    Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(
+        OrtArenaAllocator, OrtMemTypeDefault);
+    Ort::Value input_tensor{nullptr};
+    const auto source_value = [this, &image, pixel_count](
+                                  std::size_t tensor_index) {
+        if (!onnx_state_->input_nchw) {
+            return static_cast<float>(image[tensor_index]) * onnx_input_scale_;
+        }
+        const std::size_t channel = tensor_index / pixel_count;
+        const std::size_t pixel = tensor_index % pixel_count;
+        return static_cast<float>(image[pixel * 3U + channel]) *
+               onnx_input_scale_;
+    };
+
+    if (onnx_state_->input_type == OnnxState::InputType::Float32) {
+        onnx_state_->float_input.resize(expected_size);
+        for (std::size_t index = 0U; index < expected_size; ++index) {
+            onnx_state_->float_input[index] = source_value(index);
+        }
+        input_tensor = Ort::Value::CreateTensor<float>(
+            memory_info, onnx_state_->float_input.data(),
+            onnx_state_->float_input.size(), input_shape.data(),
+            input_shape.size());
+    } else if (onnx_state_->input_type == OnnxState::InputType::Float16) {
+        onnx_state_->float16_input.resize(expected_size);
+        for (std::size_t index = 0U; index < expected_size; ++index) {
+            onnx_state_->float16_input[index] = Ort::Float16_t(source_value(index));
+        }
+        input_tensor = Ort::Value::CreateTensor<Ort::Float16_t>(
+            memory_info, onnx_state_->float16_input.data(),
+            onnx_state_->float16_input.size(), input_shape.data(),
+            input_shape.size());
+    } else {
+        onnx_state_->uint8_input.resize(expected_size);
+        if (onnx_state_->input_nchw) {
+            for (std::size_t tensor_index = 0U;
+                 tensor_index < expected_size; ++tensor_index) {
+                const std::size_t channel = tensor_index / pixel_count;
+                const std::size_t pixel = tensor_index % pixel_count;
+                onnx_state_->uint8_input[tensor_index] =
+                    image[pixel * 3U + channel];
+            }
+        } else {
+            std::copy(image.begin(), image.end(), onnx_state_->uint8_input.begin());
+        }
+        input_tensor = Ort::Value::CreateTensor<std::uint8_t>(
+            memory_info, onnx_state_->uint8_input.data(),
+            onnx_state_->uint8_input.size(), input_shape.data(),
+            input_shape.size());
+    }
+
+    const char* input_name = onnx_state_->input_name.c_str();
+    std::vector<const char*> output_names;
+    output_names.reserve(onnx_state_->output_names.size());
+    for (const auto& name : onnx_state_->output_names) {
+        output_names.push_back(name.c_str());
+    }
+
+    auto output_tensors = onnx_state_->session.Run(
+        Ort::RunOptions{nullptr}, &input_name, &input_tensor, 1U,
+        output_names.data(), output_names.size());
+
+    for (std::size_t index = 0U; index < output_tensors.size(); ++index) {
+        auto& tensor = output_tensors[index];
+        if (!tensor.IsTensor()) {
+            continue;
+        }
+        const auto info = tensor.GetTensorTypeAndShapeInfo();
+        const auto output_type = info.GetElementType();
+        if (output_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT &&
+            output_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+            continue;
+        }
+        const auto shape = info.GetShape();
+        if (shape.size() != 3U || shape[0] != 1 ||
+            shape[1] <= 0 || shape[2] <= 0) {
+            continue;
+        }
+
+        const auto dim_a = static_cast<std::size_t>(shape[1]);
+        const auto dim_b = static_cast<std::size_t>(shape[2]);
+        std::size_t rows = 0U;
+        std::size_t attributes = 0U;
+        bool attributes_first = false;
+        if (dim_b >= kAttributesPerAnchor && dim_b <= 512U) {
+            rows = dim_a;
+            attributes = dim_b;
+        } else if (dim_a >= kAttributesPerAnchor && dim_a <= 512U) {
+            rows = dim_b;
+            attributes = dim_a;
+            attributes_first = true;
+        } else {
+            continue;
+        }
+
+        const float* data = nullptr;
+        if (output_type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+            data = tensor.GetTensorData<float>();
+        } else {
+            const auto element_count = info.GetElementCount();
+            const auto* float16_data = tensor.GetTensorData<Ort::Float16_t>();
+            onnx_state_->float_output.resize(element_count);
+            std::transform(
+                float16_data, float16_data + element_count,
+                onnx_state_->float_output.begin(),
+                [](const Ort::Float16_t value) { return value.ToFloat(); });
+            data = onnx_state_->float_output.data();
+        }
+        auto candidates = decode_flat_output(
+            data, rows, attributes, attributes_first);
+        return apply_nms(std::move(candidates));
+    }
+
+    throw std::runtime_error(
+        "YOLO ONNX model has no float32/float16 decoded output shaped "
+        "[1,N,85] or [1,85,N]");
+}
+
+std::vector<YoloProcessor::Detection> YoloProcessor::infer_rknn(
     const ByteArray& image) {
     const auto expected_size = static_cast<std::size_t>(input_width_) *
                                input_height_ * 3U;
@@ -773,9 +1219,11 @@ std::vector<YoloProcessor::Detection> YoloProcessor::infer(
                             const float h = output_value(
                                 head, data, base + 3U, row, column);
                             const float center_x =
-                                (x * 2.0F - 0.5F + column) * head.stride;
+                                (x * 2.0F - 0.5F + static_cast<float>(column)) *
+                                static_cast<float>(head.stride);
                             const float center_y =
-                                (y * 2.0F - 0.5F + row) * head.stride;
+                                (y * 2.0F - 0.5F + static_cast<float>(row)) *
+                                static_cast<float>(head.stride);
                             const float box_width = std::pow(w * 2.0F, 2.0F) *
                                 static_cast<float>(anchors[anchor * 2U]);
                             const float box_height = std::pow(h * 2.0F, 2.0F) *
@@ -810,30 +1258,7 @@ std::vector<YoloProcessor::Detection> YoloProcessor::infer(
         context_, static_cast<std::uint32_t>(raw_outputs.size()),
         raw_outputs.data());
 
-    std::sort(candidates.begin(), candidates.end(),
-              [](const Detection& left, const Detection& right) {
-                  return left.confidence > right.confidence;
-              });
-    std::vector<bool> suppressed(candidates.size(), false);
-    std::vector<Detection> result;
-    result.reserve(std::min<std::size_t>(max_detections_, candidates.size()));
-    for (std::size_t index = 0U; index < candidates.size(); ++index) {
-        if (suppressed[index]) {
-            continue;
-        }
-        result.push_back(candidates[index]);
-        if (result.size() >= max_detections_) {
-            break;
-        }
-        for (std::size_t other = index + 1U; other < candidates.size(); ++other) {
-            if (!suppressed[other] &&
-                candidates[other].class_id == candidates[index].class_id &&
-                overlap(candidates[index], candidates[other]) > nms_threshold_) {
-                suppressed[other] = true;
-            }
-        }
-    }
-    return result;
+    return apply_nms(std::move(candidates));
 }
 
 void YoloProcessor::annotate(
@@ -921,7 +1346,7 @@ void YoloProcessor::process(Event& event, ProcessingContext& context) {
                 output->quality = Quality::Good;
             }
         }
-        event.model_version = "yolov5s-rk3566-rknn";
+        event.model_version = model_version_;
         std::cerr << "[yolo] event=" << event.event_id
                   << " detections=" << detections.size() << "\n";
     } catch (const std::exception& error) {

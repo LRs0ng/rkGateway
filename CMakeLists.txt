@@ -126,11 +126,48 @@ configure_file(
     "${CMAKE_CURRENT_BINARY_DIR}/miniGateway/librknnrt.so"
     COPYONLY)
 
+# ONNX Runtime CPU backend for the YOLO plugin.  The repository-local
+# package contains AArch64 headers and shared libraries, so do not search the
+# host system and accidentally link an x86_64 runtime into the cross build.
+set(ONNXRUNTIME_ROOT
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime"
+    CACHE PATH "AArch64 ONNX Runtime package root")
+find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
+    PATHS "${ONNXRUNTIME_ROOT}/include" NO_DEFAULT_PATH REQUIRED)
+find_library(ONNXRUNTIME_LIBRARY NAMES onnxruntime
+    PATHS "${ONNXRUNTIME_ROOT}/lib" "${ONNXRUNTIME_ROOT}/lib64"
+    NO_DEFAULT_PATH REQUIRED)
+add_library(ONNXRuntime::Runtime SHARED IMPORTED GLOBAL)
+set_target_properties(ONNXRuntime::Runtime PROPERTIES
+    IMPORTED_LOCATION "${ONNXRUNTIME_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${ONNXRUNTIME_INCLUDE_DIR}")
+
+file(GLOB ONNXRUNTIME_RUNTIME_LIBRARIES
+    "${ONNXRUNTIME_ROOT}/lib/libonnxruntime.so*"
+    "${ONNXRUNTIME_ROOT}/lib/libonnxruntime_providers_shared.so*"
+    "${ONNXRUNTIME_ROOT}/lib64/libonnxruntime.so*"
+    "${ONNXRUNTIME_ROOT}/lib64/libonnxruntime_providers_shared.so*")
+if(NOT ONNXRUNTIME_RUNTIME_LIBRARIES)
+    message(FATAL_ERROR
+        "No AArch64 ONNX Runtime shared libraries found below ${ONNXRUNTIME_ROOT}")
+endif()
+file(COPY ${ONNXRUNTIME_RUNTIME_LIBRARIES}
+    DESTINATION "${CMAKE_CURRENT_BINARY_DIR}/miniGateway"
+    FOLLOW_SYMLINK_CHAIN)
+
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/miniGateway/model")
-configure_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/plugins/yolo/model/yolov5s_rk3566.rknn"
-    "${CMAKE_CURRENT_BINARY_DIR}/miniGateway/model/yolov5s_rk3566.rknn"
-    COPYONLY)
+foreach(YOLO_MODEL IN ITEMS
+        yolov5s_rk3566.rknn
+        yolov5n_rk3566.rknn
+        yolov5n.onnx)
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/plugins/yolo/model/${YOLO_MODEL}")
+        message(FATAL_ERROR "Missing YOLO model: plugins/yolo/model/${YOLO_MODEL}")
+    endif()
+    configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/plugins/yolo/model/${YOLO_MODEL}"
+        "${CMAKE_CURRENT_BINARY_DIR}/miniGateway/model/${YOLO_MODEL}"
+        COPYONLY)
+endforeach()
 
 add_library(camera_capture_support STATIC
     plugins/camera/camera_capture.c)
@@ -226,10 +263,11 @@ add_library(gateway_yolo SHARED
 target_include_directories(gateway_yolo PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/plugins/yolo"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniGateway/include"
-    "${RKNN_INCLUDE_DIR}")
+    "${RKNN_INCLUDE_DIR}"
+    "${ONNXRUNTIME_INCLUDE_DIR}")
 target_link_libraries(gateway_yolo
     PUBLIC gateway_core
-    PRIVATE nlohmann_json::nlohmann_json RKNN::RT m)
+    PRIVATE nlohmann_json::nlohmann_json RKNN::RT ONNXRuntime::Runtime m)
 set_target_properties(gateway_yolo PROPERTIES
     OUTPUT_NAME "gateway_yolo"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/miniGateway"
