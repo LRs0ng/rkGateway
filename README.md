@@ -20,3 +20,5 @@
 [![点击观看演示视频](docs/covers/framework-cover1.png)](https://github.com/user-attachments/assets/b71753f6-4bb0-465f-9368-12bd3c498753)
 #### 温度采集+ADC电压采集+mqtt上报
 [![点击观看演示视频](docs/covers/framework-cover2.png)](https://github.com/user-attachments/assets/da838a71-377c-43ea-8b61-3e69e228e0d0)
+### npu推理加速
+[![点击观看演示视频](docs/covers/yolo-cover.jpg)](https://github.com/user-attachments/assets/4753c1f2-d973-4099-8280-1776f524b8cb)
