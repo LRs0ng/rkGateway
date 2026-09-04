@@ -11,9 +11,10 @@
       "library": "./libgateway_camera.so",
       "driver_config": {
         "device": "/dev/video0",
-        "sensor_device": "auto",
-        "sensor_width": 1944,
-        "sensor_height": 1096,
+        "sensor_mode_width": 3864,
+        "sensor_mode_height": 2192,
+        "sensor_active_width": 3840,
+        "sensor_active_height": 2160,
         "crop_width": 1080,
         "crop_height": 1080,
         "width": 640,

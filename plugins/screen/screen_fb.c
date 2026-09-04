@@ -673,10 +673,45 @@ static const uint8_t digit_glyphs[10][7] = {
     {0x0e, 0x11, 0x11, 0x0f, 0x01, 0x02, 0x0c},
 };
 
+static const uint8_t uppercase_glyphs[26][7] = {
+    {0x0e, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11}, /* A */
+    {0x1e, 0x11, 0x11, 0x1e, 0x11, 0x11, 0x1e}, /* B */
+    {0x0e, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0e}, /* C */
+    {0x1e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1e}, /* D */
+    {0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x1f}, /* E */
+    {0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x10}, /* F */
+    {0x0e, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0f}, /* G */
+    {0x11, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11}, /* H */
+    {0x0e, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0e}, /* I */
+    {0x07, 0x02, 0x02, 0x02, 0x12, 0x12, 0x0c}, /* J */
+    {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11}, /* K */
+    {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1f}, /* L */
+    {0x11, 0x1b, 0x15, 0x15, 0x11, 0x11, 0x11}, /* M */
+    {0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11}, /* N */
+    {0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e}, /* O */
+    {0x1e, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10}, /* P */
+    {0x0e, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0d}, /* Q */
+    {0x1e, 0x11, 0x11, 0x1e, 0x14, 0x12, 0x11}, /* R */
+    {0x0f, 0x10, 0x10, 0x0e, 0x01, 0x01, 0x1e}, /* S */
+    {0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}, /* T */
+    {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e}, /* U */
+    {0x11, 0x11, 0x11, 0x11, 0x11, 0x0a, 0x04}, /* V */
+    {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0a}, /* W */
+    {0x11, 0x11, 0x0a, 0x04, 0x0a, 0x11, 0x11}, /* X */
+    {0x11, 0x11, 0x0a, 0x04, 0x04, 0x04, 0x04}, /* Y */
+    {0x1f, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1f}, /* Z */
+};
+
 static uint8_t glyph_row(char character, unsigned int row)
 {
     if (character >= '0' && character <= '9') {
         return digit_glyphs[character - '0'][row];
+    }
+    if (character >= 'a' && character <= 'z') {
+        character = (char)(character - 'a' + 'A');
+    }
+    if (character >= 'A' && character <= 'Z') {
+        return uppercase_glyphs[character - 'A'][row];
     }
     if (character == '-') {
         return row == 3U ? 0x1fU : 0U;
@@ -690,32 +725,35 @@ static uint8_t glyph_row(char character, unsigned int row)
     if (character == '.') {
         return row == 6U ? 0x04U : 0U;
     }
-    if (character == 'e' || character == 'E') {
-        static const uint8_t glyph[7] = {0x00, 0x0e, 0x11, 0x1f, 0x10, 0x11, 0x0e};
-        return glyph[row];
+    if (character == ':') {
+        return row == 2U || row == 5U ? 0x04U : 0U;
+    }
+    if (character == '/') {
+        return (uint8_t)(1U << (row < 5U ? row : 4U));
     }
     return 0U;
 }
 
-int screen_fb_draw_number_rotated(screen_fb_t *screen, double value, int x, int y,
-                                  unsigned int scale, uint32_t foreground,
-                                  uint32_t background, int clear_background,
-                                  unsigned int rotation_degrees)
+int screen_fb_draw_text_rotated(screen_fb_t *screen, const char *text, int x, int y,
+                                unsigned int scale, uint32_t foreground,
+                                uint32_t background, int clear_background,
+                                unsigned int rotation_degrees)
 {
-    char text[64];
     size_t length;
     size_t index;
     unsigned int row;
     unsigned int column;
     unsigned int glyph_width;
-    if (screen == NULL || scale == 0U || !isfinite(value) ||
+    if (screen == NULL || text == NULL || scale == 0U ||
         !valid_rotation(rotation_degrees)) {
         return set_errno_value(EINVAL);
     }
-    (void)snprintf(text, sizeof(text), "%.3f", value);
     length = strlen(text);
+    if (length > UINT_MAX / 6U / scale) {
+        return set_errno_value(EOVERFLOW);
+    }
     glyph_width = 6U * scale;
-    if (clear_background &&
+    if (clear_background && length > 0U &&
         fill_logical_rect(screen, rotation_degrees, x, y,
                           (unsigned int)length * glyph_width, 7U * scale,
                           background) < 0) {
@@ -734,7 +772,7 @@ int screen_fb_draw_number_rotated(screen_fb_t *screen, double value, int x, int 
                             if (put_logical_pixel(
                                     screen, rotation_degrees,
                                     x + (int)(index * glyph_width +
-                                               column * scale + dx),
+                                              column * scale + dx),
                                     y + (int)(row * scale + dy), foreground) < 0) {
                                 return -1;
                             }
@@ -745,6 +783,29 @@ int screen_fb_draw_number_rotated(screen_fb_t *screen, double value, int x, int 
         }
     }
     return flush_if_immediate(screen);
+}
+
+int screen_fb_draw_text(screen_fb_t *screen, const char *text, int x, int y,
+                        unsigned int scale, uint32_t foreground,
+                        uint32_t background, int clear_background)
+{
+    return screen_fb_draw_text_rotated(screen, text, x, y, scale, foreground,
+                                       background, clear_background, 0U);
+}
+
+int screen_fb_draw_number_rotated(screen_fb_t *screen, double value, int x, int y,
+                                  unsigned int scale, uint32_t foreground,
+                                  uint32_t background, int clear_background,
+                                  unsigned int rotation_degrees)
+{
+    char text[64];
+    if (!isfinite(value)) {
+        return set_errno_value(EINVAL);
+    }
+    (void)snprintf(text, sizeof(text), "%.3f", value);
+    return screen_fb_draw_text_rotated(screen, text, x, y, scale, foreground,
+                                       background, clear_background,
+                                       rotation_degrees);
 }
 
 int screen_fb_draw_number(screen_fb_t *screen, double value, int x, int y,

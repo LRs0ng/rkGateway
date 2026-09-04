@@ -230,16 +230,17 @@ void put_pixel(ByteArray& image, unsigned int width, unsigned int height,
 }
 
 void draw_rect(ByteArray& image, unsigned int width, unsigned int height,
-               const YoloProcessor::Detection& detection, std::uint32_t color) {
-    const int thickness = 2;
-    for (int offset = 0; offset < thickness; ++offset) {
+               const YoloProcessor::Detection& detection, std::uint32_t color,
+               unsigned int thickness) {
+    for (unsigned int offset = 0U; offset < thickness; ++offset) {
+        const int inset = static_cast<int>(offset);
         for (int x = detection.left; x <= detection.right; ++x) {
-            put_pixel(image, width, height, x, detection.top + offset, color);
-            put_pixel(image, width, height, x, detection.bottom - offset, color);
+            put_pixel(image, width, height, x, detection.top + inset, color);
+            put_pixel(image, width, height, x, detection.bottom - inset, color);
         }
         for (int y = detection.top; y <= detection.bottom; ++y) {
-            put_pixel(image, width, height, detection.left + offset, y, color);
-            put_pixel(image, width, height, detection.right - offset, y, color);
+            put_pixel(image, width, height, detection.left + inset, y, color);
+            put_pixel(image, width, height, detection.right - inset, y, color);
         }
     }
 }
@@ -299,9 +300,9 @@ std::array<std::uint8_t, 7> glyph(char character) {
 
 void draw_text(ByteArray& image, unsigned int width, unsigned int height,
                int x, int y, std::string_view text, std::uint32_t color,
-               std::uint32_t background) {
-    const int glyph_width = 6;
-    const int glyph_height = 8;
+               std::uint32_t background, unsigned int scale) {
+    const int glyph_width = static_cast<int>(6U * scale);
+    const int glyph_height = static_cast<int>(8U * scale);
     const int start_x = x;
     for (const char character : text) {
         if (character == '\n') {
@@ -312,10 +313,22 @@ void draw_text(ByteArray& image, unsigned int width, unsigned int height,
         const auto bitmap = glyph(character);
         for (int row = 0; row < 7; ++row) {
             for (int column = 0; column < 5; ++column) {
-                put_pixel(image, width, height, x + column, y + row,
-                          (bitmap[static_cast<std::size_t>(row)] &
-                           (1U << (4U - static_cast<unsigned int>(column))))
-                              ? color : background);
+                const std::uint32_t pixel_color =
+                    (bitmap[static_cast<std::size_t>(row)] &
+                     (1U << (4U - static_cast<unsigned int>(column))))
+                        ? color
+                        : background;
+                for (unsigned int dy = 0U; dy < scale; ++dy) {
+                    for (unsigned int dx = 0U; dx < scale; ++dx) {
+                        put_pixel(
+                            image, width, height,
+                            x + column * static_cast<int>(scale) +
+                                static_cast<int>(dx),
+                            y + row * static_cast<int>(scale) +
+                                static_cast<int>(dy),
+                            pixel_color);
+                    }
+                }
             }
         }
         x += glyph_width;
@@ -338,6 +351,16 @@ std::unique_ptr<YoloProcessor> make_yolo(std::string_view settings_json) {
     if (!(nms >= 0.0F && nms <= 1.0F)) {
         plugin_json::fail(kPluginName, "nms_threshold", "must be between 0 and 1");
     }
+    const auto box_thickness =
+        optional_unsigned(settings, "box_thickness", 4U, true);
+    const auto label_scale =
+        optional_unsigned(settings, "label_scale", 2U, true);
+    if (box_thickness > 32U) {
+        plugin_json::fail(kPluginName, "box_thickness", "must be between 1 and 32");
+    }
+    if (label_scale > 8U) {
+        plugin_json::fail(kPluginName, "label_scale", "must be between 1 and 8");
+    }
     return std::make_unique<YoloProcessor>(
         optional_string(settings, "model", "./model/yolov5s_rk3566.rknn"),
         optional_string(settings, "input_point", "image"),
@@ -348,8 +371,8 @@ std::unique_ptr<YoloProcessor> make_yolo(std::string_view settings_json) {
         width, height, confidence, nms,
         optional_unsigned(settings, "max_detections", 64U, true),
         optional_unsigned(settings, "control_timeout_ms", 5000U, true),
-        optional_bool(settings, "draw_confidence", true),
-        parse_color(settings, "box_color", 0x00ff00U),
+        optional_bool(settings, "draw_confidence", true), box_thickness,
+        label_scale, parse_color(settings, "box_color", 0x00ff00U),
         parse_color(settings, "text_color", 0xffffffU));
 }
 
@@ -369,6 +392,8 @@ YoloProcessor::YoloProcessor(
     unsigned int max_detections,
     unsigned int control_timeout_ms,
     bool draw_confidence,
+    unsigned int box_thickness,
+    unsigned int label_scale,
     std::uint32_t box_color,
     std::uint32_t text_color)
     : model_path_(std::move(model_path)),
@@ -384,13 +409,16 @@ YoloProcessor::YoloProcessor(
       max_detections_(max_detections),
       control_timeout_ms_(control_timeout_ms),
       draw_confidence_(draw_confidence),
+      box_thickness_(box_thickness),
+      label_scale_(label_scale),
       box_color_(box_color),
       text_color_(text_color) {
     if (model_path_.empty() || input_point_.empty() || output_point_.empty() ||
         camera_device_id_.empty() || camera_command_.empty() ||
         control_request_prefix_.empty() || input_width_ == 0U ||
         input_height_ == 0U || max_detections_ == 0U ||
-        control_timeout_ms_ == 0U) {
+        control_timeout_ms_ == 0U || box_thickness_ == 0U ||
+        label_scale_ == 0U) {
         throw std::invalid_argument("invalid YOLO processor settings");
     }
     initialize_model();
@@ -812,7 +840,8 @@ void YoloProcessor::annotate(
     ByteArray& image,
     const std::vector<Detection>& detections) const {
     for (const auto& detection : detections) {
-        draw_rect(image, input_width_, input_height_, detection, box_color_);
+        draw_rect(image, input_width_, input_height_, detection, box_color_,
+                  box_thickness_);
         std::string label = detection.class_id >= 0 &&
                                     static_cast<std::size_t>(detection.class_id) <
                                         kCocoLabels.size()
@@ -822,8 +851,11 @@ void YoloProcessor::annotate(
             label += " " + std::to_string(static_cast<int>(
                 std::lround(detection.confidence * 100.0F))) + "%";
         }
-        const int label_height = 9;
-        const int label_width = static_cast<int>(label.size()) * 6 + 2;
+        const int padding = static_cast<int>(label_scale_);
+        const int label_height = static_cast<int>(7U * label_scale_) +
+                                 padding * 2;
+        const int label_width = static_cast<int>(label.size() * 6U * label_scale_) +
+                                padding * 2;
         const int label_x = std::max(0, detection.left);
         const int label_y = std::max(0, detection.top - label_height);
         for (int y = label_y; y < label_y + label_height; ++y) {
@@ -831,8 +863,9 @@ void YoloProcessor::annotate(
                 put_pixel(image, input_width_, input_height_, x, y, box_color_);
             }
         }
-        draw_text(image, input_width_, input_height_, label_x + 1, label_y + 1,
-                  label, text_color_, box_color_);
+        draw_text(image, input_width_, input_height_, label_x + padding,
+                  label_y + padding, label, text_color_, box_color_,
+                  label_scale_);
     }
 }
 

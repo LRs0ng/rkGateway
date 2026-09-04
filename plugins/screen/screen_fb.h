@@ -90,6 +90,26 @@ int screen_fb_present_rotated_to(screen_fb_t *screen,
                                  uint32_t background_rgb888,
                                  unsigned int rotation_degrees);
 
+/* Draw 5x7 ASCII text in logical coordinates. */
+int screen_fb_draw_text(screen_fb_t *screen,
+                        const char *text,
+                        int x,
+                        int y,
+                        unsigned int scale,
+                        uint32_t foreground_rgb888,
+                        uint32_t background_rgb888,
+                        int clear_background);
+
+int screen_fb_draw_text_rotated(screen_fb_t *screen,
+                                const char *text,
+                                int x,
+                                int y,
+                                unsigned int scale,
+                                uint32_t foreground_rgb888,
+                                uint32_t background_rgb888,
+                                int clear_background,
+                                unsigned int rotation_degrees);
+
 /* Draw a small 5x7 numeric string in logical coordinates. */
 int screen_fb_draw_number(screen_fb_t *screen,
                           double value,

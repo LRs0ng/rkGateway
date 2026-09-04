@@ -76,6 +76,20 @@ unsigned int optional_unsigned(
     return static_cast<unsigned int>(parsed);
 }
 
+unsigned int required_positive_unsigned(
+    const plugin_json::Json& settings,
+    std::string_view key) {
+    const auto parsed = plugin_json::unsigned_integer_member(
+        settings, key, kPluginName);
+    if (parsed == 0U ||
+        parsed > static_cast<std::uint64_t>(
+                     std::numeric_limits<unsigned int>::max())) {
+        plugin_json::fail(kPluginName, key,
+                          parsed == 0U ? "must be positive" : "is too large");
+    }
+    return static_cast<unsigned int>(parsed);
+}
+
 int optional_signed(
     const plugin_json::Json& settings,
     std::string_view key,
@@ -166,6 +180,14 @@ camera_pixel_format_t parse_pixel_format(const plugin_json::Json& settings) {
 
 std::unique_ptr<CameraDriver> make_camera(std::string_view settings_json) {
     const auto settings = plugin_json::parse_object(settings_json, kPluginName);
+    if (optional_member(settings, "sensor_device") != nullptr ||
+        optional_member(settings, "sensor_width") != nullptr ||
+        optional_member(settings, "sensor_height") != nullptr) {
+        plugin_json::fail(
+            kPluginName, "sensor_*",
+            "obsolete fields were removed; use sensor_mode_width, "
+            "sensor_mode_height, sensor_active_width and sensor_active_height");
+    }
     const auto mode = parse_mode(settings);
     const auto interval_ms = optional_unsigned(settings, "interval_ms", 10000U,
                                                mode == CameraDriver::Mode::Periodic);
@@ -185,9 +207,10 @@ std::unique_ptr<CameraDriver> make_camera(std::string_view settings_json) {
     }
     return std::make_unique<CameraDriver>(
         optional_string(settings, "device", "/dev/video0"),
-        optional_string(settings, "sensor_device", "auto"),
-        optional_unsigned(settings, "sensor_width", 1944U, true),
-        optional_unsigned(settings, "sensor_height", 1096U, true),
+        required_positive_unsigned(settings, "sensor_mode_width"),
+        required_positive_unsigned(settings, "sensor_mode_height"),
+        required_positive_unsigned(settings, "sensor_active_width"),
+        required_positive_unsigned(settings, "sensor_active_height"),
         optional_unsigned(settings, "crop_width", 1080U, true),
         optional_unsigned(settings, "crop_height", 1080U, true),
         optional_unsigned(settings, "width", 640U, true),
@@ -213,9 +236,10 @@ std::unique_ptr<CameraDriver> make_camera(std::string_view settings_json) {
 
 CameraDriver::CameraDriver(
     std::string device_path,
-    std::string sensor_device,
-    unsigned int sensor_width,
-    unsigned int sensor_height,
+    unsigned int sensor_mode_width,
+    unsigned int sensor_mode_height,
+    unsigned int sensor_active_width,
+    unsigned int sensor_active_height,
     unsigned int crop_width,
     unsigned int crop_height,
     unsigned int width,
@@ -234,9 +258,10 @@ CameraDriver::CameraDriver(
     std::string control_device,
     camera_control_settings_t controls)
     : device_path_(std::move(device_path)),
-      sensor_device_(std::move(sensor_device)),
-      sensor_width_(sensor_width),
-      sensor_height_(sensor_height),
+      sensor_mode_width_(sensor_mode_width),
+      sensor_mode_height_(sensor_mode_height),
+      sensor_active_width_(sensor_active_width),
+      sensor_active_height_(sensor_active_height),
       crop_width_(crop_width),
       crop_height_(crop_height),
       width_(width),
@@ -258,10 +283,14 @@ CameraDriver::CameraDriver(
     capture_.sensor_fd = -1;
     capture_.control_fd = -1;
     capture_.cancel_fd = -1;
-    if (device_path_.empty() || sensor_device_.empty() ||
-        sensor_width_ == 0U || sensor_height_ == 0U ||
+    if (device_path_.empty() ||
+        sensor_mode_width_ == 0U || sensor_mode_height_ == 0U ||
+        sensor_active_width_ == 0U || sensor_active_height_ == 0U ||
+        sensor_active_width_ > sensor_mode_width_ ||
+        sensor_active_height_ > sensor_mode_height_ ||
         crop_width_ == 0U || crop_height_ == 0U ||
-        crop_width_ > sensor_width_ || crop_height_ > sensor_height_ ||
+        crop_width_ > sensor_active_width_ ||
+        crop_height_ > sensor_active_height_ ||
         width_ == 0U || height_ == 0U ||
         (rga_rgb24_ && pixel_format_ != CAMERA_PIXFMT_AUTO &&
          pixel_format_ != CAMERA_PIXFMT_NV12) ||
@@ -320,9 +349,10 @@ void CameraDriver::start() {
         latest_error_.clear();
     }
     const camera_pipeline_settings_t pipeline{
-        .sensor_device = sensor_device_.c_str(),
-        .sensor_width = sensor_width_,
-        .sensor_height = sensor_height_,
+        .sensor_mode_width = sensor_mode_width_,
+        .sensor_mode_height = sensor_mode_height_,
+        .sensor_active_width = sensor_active_width_,
+        .sensor_active_height = sensor_active_height_,
         .crop_width = crop_width_,
         .crop_height = crop_height_,
         .rga_rgb24 = rga_rgb24_ ? 1 : 0,
@@ -335,8 +365,9 @@ void CameraDriver::start() {
             "cannot start camera " + device_path_ + ": " +
             std::strerror(errno));
     }
-    std::cerr << "[camera] sensor=" << sensor_device_
-              << " mode=" << sensor_width_ << "x" << sensor_height_
+    std::cerr << "[camera] sensor_mode=" << sensor_mode_width_ << "x"
+              << sensor_mode_height_ << " active=" << sensor_active_width_
+              << "x" << sensor_active_height_ << " (kernel configured)"
               << " crop=" << capture_.crop_left << "," << capture_.crop_top
               << "/" << capture_.crop_width << "x" << capture_.crop_height
               << " rkisp_output=" << capture_.width << "x" << capture_.height

@@ -3,6 +3,8 @@
 #include "gateway/event_publisher.hpp"
 #include "screen_fb.h"
 
+#include <chrono>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -42,7 +44,17 @@ private:
     uint32_t numeric_background_{0x000000U};
     bool clear_before_numeric_{true};
     bool wait_for_vsync_{true};
+    bool show_camera_frame_stats_{false};
+    std::string camera_device_id_;
+    unsigned int frame_stats_scale_{2};
+    unsigned int frame_stats_margin_x_{16};
+    unsigned int frame_stats_margin_y_{16};
+    uint32_t frame_stats_foreground_{0x00ff00U};
+    uint32_t frame_stats_background_{0x000000U};
 
+    std::uint64_t camera_frame_count_{0};
+    double camera_fps_{0.0};
+    std::chrono::steady_clock::time_point last_camera_frame_at_{};
     screen_fb_t* screen_{nullptr};
     std::mutex mutex_;
     bool configured_{false};

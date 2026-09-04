@@ -34,11 +34,12 @@ static void usage(const char *program)
             "  -i, --interval-ms N     连续抓拍间隔，默认 1000 ms\n"
             "  -t, --timeout-ms N      单帧等待超时，默认 3000 ms\n"
             "  -u, --warmup N          丢弃初始帧数，默认 3\n"
-            "      --pipeline          启用 1944x1096 -> 中央1080x1080 -> 640x640\n"
-            "                          NV12 -> RGA RGB24 流水线\n"
-            "      --sensor-device P   IMX415 subdev，默认 auto\n"
-            "      --sensor-width N    sensor 模式宽度，默认 1944\n"
-            "      --sensor-height N   sensor 模式高度，默认 1096\n"
+            "      --pipeline          保持内核 media pipeline 配置，RKISP 中央裁剪/缩放\n"
+            "                          NV12 -> RGA RGB24，默认输出 640x640\n"
+            "      --sensor-mode-width N   IMX415 驱动模式宽度，默认 3864\n"
+            "      --sensor-mode-height N  IMX415 驱动模式高度，默认 2192\n"
+            "      --sensor-active-width N 有效图像宽度，默认 3840\n"
+            "      --sensor-active-height N 有效图像高度，默认 2160\n"
             "      --crop-width N      RKISP 中央裁剪宽度，默认 1080\n"
             "      --crop-height N     RKISP 中央裁剪高度，默认 1080\n"
             "      --control-device P  IMX415 控制节点，默认 auto\n"
@@ -212,9 +213,10 @@ int main(int argc, char **argv)
     int format_explicit = 0;
     int pipeline_enabled = 0;
     camera_pipeline_settings_t pipeline = {
-        .sensor_device = "auto",
-        .sensor_width = 1944U,
-        .sensor_height = 1096U,
+        .sensor_mode_width = 3864U,
+        .sensor_mode_height = 2192U,
+        .sensor_active_width = 3840U,
+        .sensor_active_height = 2160U,
         .crop_width = 1080U,
         .crop_height = 1080U,
         .rga_rgb24 = 1,
@@ -243,9 +245,10 @@ int main(int argc, char **argv)
         {"warmup", required_argument, NULL, 'u'},
         {"pipeline", no_argument, NULL, 6},
         {"rga-pipeline", no_argument, NULL, 6},
-        {"sensor-device", required_argument, NULL, 7},
-        {"sensor-width", required_argument, NULL, 8},
-        {"sensor-height", required_argument, NULL, 9},
+        {"sensor-mode-width", required_argument, NULL, 7},
+        {"sensor-mode-height", required_argument, NULL, 8},
+        {"sensor-active-width", required_argument, NULL, 9},
+        {"sensor-active-height", required_argument, NULL, 12},
         {"crop-width", required_argument, NULL, 10},
         {"crop-height", required_argument, NULL, 11},
         {"control-device", required_argument, NULL, 2},
@@ -315,21 +318,33 @@ int main(int argc, char **argv)
             pipeline_enabled = 1;
             break;
         case 7:
-            pipeline.sensor_device = optarg;
+            if (parse_unsigned(optarg, &pipeline.sensor_mode_width) < 0 ||
+                pipeline.sensor_mode_width == 0U) {
+                fprintf(stderr, "无效 sensor mode 宽度: %s\n", optarg);
+                return EXIT_FAILURE;
+            }
             pipeline_enabled = 1;
             break;
         case 8:
-            if (parse_unsigned(optarg, &pipeline.sensor_width) < 0 ||
-                pipeline.sensor_width == 0U) {
-                fprintf(stderr, "无效 sensor 宽度: %s\n", optarg);
+            if (parse_unsigned(optarg, &pipeline.sensor_mode_height) < 0 ||
+                pipeline.sensor_mode_height == 0U) {
+                fprintf(stderr, "无效 sensor mode 高度: %s\n", optarg);
                 return EXIT_FAILURE;
             }
             pipeline_enabled = 1;
             break;
         case 9:
-            if (parse_unsigned(optarg, &pipeline.sensor_height) < 0 ||
-                pipeline.sensor_height == 0U) {
-                fprintf(stderr, "无效 sensor 高度: %s\n", optarg);
+            if (parse_unsigned(optarg, &pipeline.sensor_active_width) < 0 ||
+                pipeline.sensor_active_width == 0U) {
+                fprintf(stderr, "无效 sensor 有效宽度: %s\n", optarg);
+                return EXIT_FAILURE;
+            }
+            pipeline_enabled = 1;
+            break;
+        case 12:
+            if (parse_unsigned(optarg, &pipeline.sensor_active_height) < 0 ||
+                pipeline.sensor_active_height == 0U) {
+                fprintf(stderr, "无效 sensor 有效高度: %s\n", optarg);
                 return EXIT_FAILURE;
             }
             pipeline_enabled = 1;
@@ -392,9 +407,12 @@ int main(int argc, char **argv)
         if (!format_explicit) {
             requested_format = CAMERA_PIXFMT_NV12;
         }
-        if (pipeline.crop_width > pipeline.sensor_width ||
-            pipeline.crop_height > pipeline.sensor_height) {
-            fprintf(stderr, "裁剪尺寸不能超过 sensor 模式尺寸\n");
+        if (pipeline.sensor_active_width > pipeline.sensor_mode_width ||
+            pipeline.sensor_active_height > pipeline.sensor_mode_height ||
+            pipeline.crop_width > pipeline.sensor_active_width ||
+            pipeline.crop_height > pipeline.sensor_active_height) {
+            fprintf(stderr,
+                    "sensor mode、有效图像区域和裁剪尺寸的关系无效\n");
             return EXIT_FAILURE;
         }
         if (requested_format != CAMERA_PIXFMT_AUTO &&
@@ -443,11 +461,13 @@ int main(int argc, char **argv)
            camera_pixel_format_name(capture.pixfmt), capture.width,
            capture.height, output_base);
     if (pipeline_enabled) {
-        printf("pipeline=sensor:%s/%ux%u crop:%u,%u/%ux%u "
+        printf("pipeline=sensor-mode:%ux%u active:%ux%u(kernel-configured) "
+               "mainpath-crop:%u,%u/%ux%u rkisp-output:%ux%u NV12 "
                "frame-output=RGB24(RGA)\n",
-               pipeline.sensor_device, pipeline.sensor_width,
-               pipeline.sensor_height, capture.crop_left, capture.crop_top,
-               capture.crop_width, capture.crop_height);
+               pipeline.sensor_mode_width, pipeline.sensor_mode_height,
+               pipeline.sensor_active_width, pipeline.sensor_active_height,
+               capture.crop_left, capture.crop_top, capture.crop_width,
+               capture.crop_height, capture.width, capture.height);
     }
     while (!stop_requested && (count == 0U || sample < count)) {
         camera_frame_t frame;

@@ -1,8 +1,8 @@
 {
   "runtime": {
     "run_duration_ms": null,
-    "raw_queue_capacity": 8,
-    "control_queue_capacity": 8
+    "raw_queue_capacity": 32,
+    "control_queue_capacity": 32
   },
   "devices": [
     {
@@ -11,9 +11,10 @@
       "library": "./libgateway_camera.so",
       "driver_config": {
         "device": "/dev/video0",
-        "sensor_device": "auto",
-        "sensor_width": 1944,
-        "sensor_height": 1096,
+        "sensor_mode_width": 3864,
+        "sensor_mode_height": 2192,
+        "sensor_active_width": 3840,
+        "sensor_active_height": 2160,
         "crop_width": 1080,
         "crop_height": 1080,
         "width": 640,
@@ -63,6 +64,8 @@
         "max_detections": 64,
         "control_timeout_ms": 5000,
         "draw_confidence": true,
+        "box_thickness": 5,
+        "label_scale": 2,
         "box_color": "0x00ff00",
         "text_color": "0xffffff"
       }
@@ -96,7 +99,14 @@
         "numeric_foreground": "0xffffff",
         "numeric_background": "0x000000",
         "clear_before_numeric": true,
-        "wait_for_vsync": true
+        "wait_for_vsync": true,
+        "show_camera_frame_stats": true,
+        "camera_device_id": "camera-1",
+        "frame_stats_scale": 3,
+        "frame_stats_margin_x": 24,
+        "frame_stats_margin_y": 24,
+        "frame_stats_foreground": "0x00ff00",
+        "frame_stats_background": "0x000000"
       }
     }
   ],

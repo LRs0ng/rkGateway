@@ -25,6 +25,8 @@ public:
         unsigned int max_detections,
         unsigned int control_timeout_ms,
         bool draw_confidence,
+        unsigned int box_thickness,
+        unsigned int label_scale,
         std::uint32_t box_color,
         std::uint32_t text_color);
     ~YoloProcessor() override;
@@ -91,6 +93,8 @@ private:
     unsigned int max_detections_;
     unsigned int control_timeout_ms_;
     bool draw_confidence_;
+    unsigned int box_thickness_;
+    unsigned int label_scale_;
     std::uint32_t box_color_;
     std::uint32_t text_color_;
 

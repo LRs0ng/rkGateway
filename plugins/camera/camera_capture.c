@@ -4,8 +4,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <linux/media-bus-format.h>
-#include <linux/v4l2-subdev.h>
 #include <poll.h>
 #include <rga/im2d.h>
 #include <stdint.h>
@@ -289,18 +287,6 @@ static int open_auto_sensor_device(void)
     return set_errno(ENODEV);
 }
 
-static int open_sensor_device(const char *sensor_device)
-{
-    if (sensor_device == NULL || sensor_device[0] == '\0' ||
-        strcasecmp(sensor_device, "auto") == 0) {
-        return open_auto_sensor_device();
-    }
-    if (strcasecmp(sensor_device, "none") == 0) {
-        return set_errno(ENODEV);
-    }
-    return open(sensor_device, O_RDWR | O_CLOEXEC);
-}
-
 static int open_control_device(const char *control_device,
                                int need_sensor_controls,
                                int sensor_fd)
@@ -321,29 +307,9 @@ static int open_control_device(const char *control_device,
     return open(control_device, O_RDWR | O_CLOEXEC);
 }
 
-static int configure_sensor_format(int fd, unsigned int width,
-                                   unsigned int height)
-{
-    struct v4l2_subdev_format format;
-
-    memset(&format, 0, sizeof(format));
-    format.which = V4L2_SUBDEV_FORMAT_ACTIVE;
-    format.pad = 0U;
-    format.format.width = width;
-    format.format.height = height;
-    format.format.code = MEDIA_BUS_FMT_SGBRG10_1X10;
-    format.format.field = V4L2_FIELD_NONE;
-    if (xioctl(fd, VIDIOC_SUBDEV_S_FMT, &format) < 0) {
-        return -1;
-    }
-    if (format.format.width != width || format.format.height != height ||
-        format.format.code != MEDIA_BUS_FMT_SGBRG10_1X10) {
-        return set_errno(ERANGE);
-    }
-    return 0;
-}
-
 static int configure_center_crop(camera_capture_t *capture,
+                                 unsigned int expected_active_width,
+                                 unsigned int expected_active_height,
                                  unsigned int crop_width,
                                  unsigned int crop_height)
 {
@@ -361,6 +327,15 @@ static int configure_center_crop(camera_capture_t *capture,
     bounds = selection.r;
     if (bounds.left < 0 || bounds.top < 0 ||
         bounds.width < crop_width || bounds.height < crop_height) {
+        return set_errno(ERANGE);
+    }
+    if ((unsigned int)bounds.width != expected_active_width ||
+        (unsigned int)bounds.height != expected_active_height) {
+        fprintf(stderr,
+                "camera: RKISP crop bounds %dx%d do not match configured "
+                "sensor active area %ux%u\n",
+                bounds.width, bounds.height, expected_active_width,
+                expected_active_height);
         return set_errno(ERANGE);
     }
 
@@ -528,10 +503,15 @@ int camera_capture_init_ex(
         return set_errno(EINVAL);
     }
     if (use_pipeline &&
-        (pipeline->sensor_width == 0U || pipeline->sensor_height == 0U ||
+        (pipeline->sensor_mode_width == 0U ||
+         pipeline->sensor_mode_height == 0U ||
+         pipeline->sensor_active_width == 0U ||
+         pipeline->sensor_active_height == 0U ||
+         pipeline->sensor_active_width > pipeline->sensor_mode_width ||
+         pipeline->sensor_active_height > pipeline->sensor_mode_height ||
          pipeline->crop_width == 0U || pipeline->crop_height == 0U ||
-         pipeline->crop_width > pipeline->sensor_width ||
-         pipeline->crop_height > pipeline->sensor_height)) {
+         pipeline->crop_width > pipeline->sensor_active_width ||
+         pipeline->crop_height > pipeline->sensor_active_height)) {
         return set_errno(EINVAL);
     }
     if (use_pipeline && pipeline->rga_rgb24 &&
@@ -549,17 +529,16 @@ int camera_capture_init_ex(
         capture->controls = *controls;
     }
     if (use_pipeline) {
-        capture->sensor_fd = open_sensor_device(pipeline->sensor_device);
-        if (capture->sensor_fd < 0) {
-            return -1;
-        }
-        if (configure_sensor_format(capture->sensor_fd,
-                                    pipeline->sensor_width,
-                                    pipeline->sensor_height) < 0) {
-            const int saved = errno;
-            camera_capture_close(capture);
-            return set_errno(saved);
-        }
+        /*
+         * Keep the sensor/CSI/RKISP sub-device ACTIVE formats established by
+         * the kernel media graph.  Forcing only the IMX415 sensor to
+         * 1944x1096 leaves downstream RKISP entities at their boot geometry
+         * on this BSP and causes CIF_ISP_PIC_SIZE_ERROR while streaming.
+         *
+         * The accelerated path only needs the mainpath crop/output format
+         * below; RGA operates on the dequeued NV12 frame and must not alter
+         * the upstream media-bus geometry.
+         */
         capture->rga_rgb24 = pipeline->rga_rgb24 != 0;
     }
     capture->fd = open(device, O_RDWR | O_NONBLOCK | O_CLOEXEC);
@@ -600,7 +579,9 @@ int camera_capture_init_ex(
     capture->buffer_type = type;
 
     if (use_pipeline &&
-        configure_center_crop(capture, pipeline->crop_width,
+        configure_center_crop(capture, pipeline->sensor_active_width,
+                              pipeline->sensor_active_height,
+                              pipeline->crop_width,
                               pipeline->crop_height) < 0) {
         const int saved = errno;
         camera_capture_close(capture);

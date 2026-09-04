@@ -35,15 +35,17 @@ typedef struct camera_control_settings {
 } camera_control_settings_t;
 
 /*
- * Optional Rockchip camera pipeline configuration.  When enabled, the sensor
- * sub-device is switched before /dev/video* is opened, RKISP performs the
- * centered crop and output scaling, and RGA converts every dequeued NV12 frame
- * to tightly packed RGB24 before it is returned to the caller.
+ * Optional Rockchip camera pipeline configuration.  The sensor/CSI/RKISP
+ * sub-device ACTIVE formats are intentionally left unchanged.  RKISP mainpath
+ * performs the centered crop and output scaling, and RGA converts every
+ * dequeued NV12 frame to tightly packed RGB24 before it is returned.
  */
 typedef struct camera_pipeline_settings {
-    const char *sensor_device;       /* "auto" finds the IMX415 sub-device. */
-    unsigned int sensor_width;
-    unsigned int sensor_height;
+    /* IMX415 driver mode and its effective image area; never forced by S_FMT. */
+    unsigned int sensor_mode_width;
+    unsigned int sensor_mode_height;
+    unsigned int sensor_active_width;
+    unsigned int sensor_active_height;
     unsigned int crop_width;
     unsigned int crop_height;
     int rga_rgb24;

@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -194,6 +195,20 @@ ScreenEventPublisher::ScreenEventPublisher(std::string settings_json)
     numeric_background_ = optional_color(settings, "numeric_background", 0x000000U);
     clear_before_numeric_ = optional_bool(settings, "clear_before_numeric", true);
     wait_for_vsync_ = optional_bool(settings, "wait_for_vsync", true);
+    show_camera_frame_stats_ =
+        optional_bool(settings, "show_camera_frame_stats", false);
+    camera_device_id_ =
+        optional_string(settings, "camera_device_id", "camera-1");
+    frame_stats_scale_ =
+        optional_unsigned(settings, "frame_stats_scale", 2U, true);
+    frame_stats_margin_x_ =
+        optional_unsigned(settings, "frame_stats_margin_x", 16U);
+    frame_stats_margin_y_ =
+        optional_unsigned(settings, "frame_stats_margin_y", 16U);
+    frame_stats_foreground_ =
+        optional_color(settings, "frame_stats_foreground", 0x00ff00U);
+    frame_stats_background_ =
+        optional_color(settings, "frame_stats_background", 0x000000U);
 }
 
 ScreenEventPublisher::~ScreenEventPublisher()
@@ -268,6 +283,9 @@ void ScreenEventPublisher::start()
         throw std::system_error(saved, std::generic_category(),
                                 "present framebuffer " + device_);
     }
+    camera_frame_count_ = 0;
+    camera_fps_ = 0.0;
+    last_camera_frame_at_ = {};
     started_ = true;
     std::cerr << "screen publisher: device=" << device_
               << " size=" << screen_fb_width(screen_) << "x"
@@ -282,6 +300,9 @@ void ScreenEventPublisher::start()
                       ? screen_fb_width(screen_) : screen_fb_height(screen_))
               << " buffering=shadow-copy"
               << " vsync=" << (wait_for_vsync_ ? "on" : "off")
+              << " frame_stats="
+              << (show_camera_frame_stats_ ? "top-right" : "off")
+              << " camera_device=" << camera_device_id_
               << "\n";
 }
 
@@ -317,6 +338,57 @@ EventPublishResult ScreenEventPublisher::publish(const Event& event)
         displayed_image = true;
     }
 
+    bool drew_frame_stats = false;
+    if (displayed_image && show_camera_frame_stats_ &&
+        event.device_id == camera_device_id_) {
+        const auto now = std::chrono::steady_clock::now();
+        ++camera_frame_count_;
+        if (last_camera_frame_at_ != std::chrono::steady_clock::time_point{}) {
+            const double elapsed_seconds =
+                std::chrono::duration<double>(now - last_camera_frame_at_).count();
+            if (elapsed_seconds > 0.0) {
+                const double instantaneous_fps = 1.0 / elapsed_seconds;
+                camera_fps_ = camera_fps_ <= 0.0
+                                  ? instantaneous_fps
+                                  : camera_fps_ * 0.8 + instantaneous_fps * 0.2;
+            }
+        }
+        last_camera_frame_at_ = now;
+
+        char stats_text[96];
+        (void)std::snprintf(
+            stats_text, sizeof(stats_text), "FRAME %llu  FPS %.1f",
+            static_cast<unsigned long long>(camera_frame_count_), camera_fps_);
+        const unsigned int logical_width =
+            (rotation_degrees_ == 90U || rotation_degrees_ == 270U)
+                ? screen_fb_height(screen_)
+                : screen_fb_width(screen_);
+        const auto text_length = std::strlen(stats_text);
+        const std::uint64_t text_width =
+            static_cast<std::uint64_t>(text_length) * 6U * frame_stats_scale_;
+        const std::uint64_t right_space =
+            text_width + static_cast<std::uint64_t>(frame_stats_margin_x_);
+        const int stats_x = right_space < logical_width
+                                ? static_cast<int>(logical_width - right_space)
+                                : 0;
+        const unsigned int logical_height =
+            (rotation_degrees_ == 90U || rotation_degrees_ == 270U)
+                ? screen_fb_width(screen_)
+                : screen_fb_height(screen_);
+        const int stats_y = frame_stats_margin_y_ < logical_height
+                                ? static_cast<int>(frame_stats_margin_y_)
+                                : 0;
+        if (screen_fb_draw_text_rotated(
+                screen_, stats_text, stats_x, stats_y, frame_stats_scale_,
+                frame_stats_foreground_, frame_stats_background_, 1,
+                rotation_degrees_) < 0) {
+            std::cerr << "screen publisher: draw camera frame statistics failed: "
+                      << std::strerror(errno) << "\n";
+            return EventPublishResult::Rejected;
+        }
+        drew_frame_stats = true;
+    }
+
     int numeric_y = numeric_y_;
     bool drew_number = false;
     for (const auto& reading : event.readings) {
@@ -337,7 +409,7 @@ EventPublishResult ScreenEventPublisher::publish(const Event& event)
         drew_number = true;
         numeric_y += static_cast<int>(10U * numeric_scale_);
     }
-    if (!displayed_image && !drew_number) {
+    if (!displayed_image && !drew_number && !drew_frame_stats) {
         return EventPublishResult::Accepted;
     }
     if (screen_fb_flush(screen_) < 0) {
@@ -355,6 +427,9 @@ void ScreenEventPublisher::stop() noexcept
         screen_fb_close(screen_);
         screen_ = nullptr;
     }
+    camera_frame_count_ = 0;
+    camera_fps_ = 0.0;
+    last_camera_frame_at_ = {};
     started_ = false;
 }
 

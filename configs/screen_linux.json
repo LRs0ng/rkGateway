@@ -11,9 +11,10 @@
       "library": "./libgateway_camera.so",
       "driver_config": {
         "device": "/dev/video0",
-        "sensor_device": "auto",
-        "sensor_width": 1944,
-        "sensor_height": 1096,
+        "sensor_mode_width": 3864,
+        "sensor_mode_height": 2192,
+        "sensor_active_width": 3840,
+        "sensor_active_height": 2160,
         "crop_width": 1080,
         "crop_height": 1080,
         "width": 640,
@@ -71,7 +72,14 @@
         "output_mode": "landscape",
         "rotation_degrees": 90,
         "image_target_width": 1080,
-        "image_target_height": 1080
+        "image_target_height": 1080,
+        "show_camera_frame_stats": true,
+        "camera_device_id": "camera-1",
+        "frame_stats_scale": 3,
+        "frame_stats_margin_x": 24,
+        "frame_stats_margin_y": 24,
+        "frame_stats_foreground": "0x00ff00",
+        "frame_stats_background": "0x000000"
       }
     }
   ],
